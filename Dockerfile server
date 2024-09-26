@@ -1,0 +1,73 @@
+FROM nvidia/cuda:11.3.1-runtime-ubuntu20.04
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    tmux \
+    nano \
+    htop \
+    wget \
+    curl \
+    git \
+    openssh-server 
+
+
+
+RUN echo 'PermitRootLogin yes\nSubsystem sftp internal-sftp\nX11Forwarding yes\nX11UseLocalhost no\nAllowTcpForwarding yes' > /etc/ssh/sshd_config
+EXPOSE 22
+RUN groupadd sshgroup
+RUN mkdir /var/run/sshd
+RUN mkdir -p /root/.ssh && \
+    chmod 0700 /root/.ssh
+COPY joker.pub /root/.ssh
+RUN cat /root/.ssh/joker.pub >> /root/.ssh/authorized_keys
+RUN echo 'PATH=$PATH:/opt/conda/bin' >> ~/.bashrc # somehow conda is missing from PATH if login via ssh
+
+RUN echo 'root:root' | chpasswd
+#RUN  echo "    IdentityFile ~/.ssh/joker.pub" >> /etc/ssh/ssh_config
+# Force bash color prompt
+RUN sed -i 's/#force_color_prompt=yes/force_color_prompt=yes/g' ~/.bashrc
+
+
+
+
+# Install base utilities
+RUN apt-get update \
+    && apt-get install -y build-essential \
+    && apt-get install -y wget \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install miniconda
+ENV CONDA_DIR /opt/conda
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \
+    /bin/bash ~/miniconda.sh -b -p /opt/conda
+
+# Put conda in path so we can use conda activate
+ENV PATH=$CONDA_DIR/bin:$PATH
+
+RUN conda install -y python=3.8
+# install pip
+RUN apt-get update && apt-get install -y python3-pip
+
+RUN pip install --upgrade pip
+RUN pip install --upgrade setuptools wheel
+RUN python -m ensurepip --upgrade
+
+RUN apt-get install -y libgl1
+
+RUN ln -s /opt/conda/etc/profile.d/conda.sh /etc/profile.d/conda.sh && \
+    echo ". /opt/conda/etc/profile.d/conda.sh \n" >> ~/.bashrc && \
+    echo "conda activate base" >> ~/.bashrc
+SHELL ["conda", "run", "-n", "base", "/bin/bash", "-c"]
+
+# install conda
+COPY requirements.txt requirements.txt
+RUN pip install -r requirements.txt
+RUN pip install torch==1.11.0+cu113 torchvision==0.12.0+cu113 torchaudio==0.11.0 --extra-index-url https://download.pytorch.org/whl/cu113
+WORKDIR /workspace
+
+RUN pip install opencv-python-headless
+
+RUN pip list
+RUN apt install nano
+
+CMD ["/bin/bash"]
