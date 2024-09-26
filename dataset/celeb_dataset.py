@@ -68,6 +68,9 @@ class CelebDataset(Dataset):
             self.idx_to_cls_map = {idx: label_list[idx] for idx in range(len(label_list))}
             self.cls_to_idx_map = {label_list[idx]: idx for idx in range(len(label_list))}
         
+        # sort the files to get the same order
+        fnames = sorted(fnames)
+
         for fname in tqdm(fnames):
             ims.append(fname)
             
@@ -89,6 +92,22 @@ class CelebDataset(Dataset):
         print('Found {} images'.format(len(ims)))
         print('Found {} masks'.format(len(masks)))
         print('Found {} captions'.format(len(texts)))
+
+        # split the data into train, test and validation
+        if self.split == 'train':
+            ims = ims[:int(0.9*len(ims))]
+            texts = texts[:int(0.9*len(texts))]
+            masks = masks[:int(0.9*len(masks))]
+        elif self.split == 'test':
+            ims = ims[int(0.9*len(ims)):0.98*len(ims)]
+            texts = texts[int(0.9*len(texts)):0.98*len(ims)]
+            masks = masks[int(0.9*len(masks)):0.98*len(ims)]
+        else:
+            ims = ims[int(0.98*len(ims)):]
+            texts = texts[int(0.98*len(texts)):]
+            masks = masks[int(0.98*len(masks)):]
+
+
         return ims, texts, masks
     
     def get_mask(self, index):

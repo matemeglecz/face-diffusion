@@ -98,6 +98,7 @@ def train(args):
     acc_steps = train_config['autoencoder_acc_steps']
     image_save_steps = train_config['autoencoder_img_save_steps']
     wandb_image_save_steps = train_config['autoencoder_img_save_steps_wandb']
+    log_step_steps_wandb = train_config['autoencoder_log_step_steps_wandb']
     img_save_count = 0
     
     for epoch_idx in range(num_epochs):
@@ -168,6 +169,15 @@ def train(args):
             g_loss += train_config['perceptual_weight']*lpips_loss / acc_steps
             losses.append(g_loss.item())
             g_loss.backward()
+
+            # log the losses in every 500 steps
+            if step_count % log_step_steps_wandb == 0 or step_count == 1:
+                wandb.log({ "Step": step_count,
+                            "Recon Loss": np.mean(recon_losses),
+                            "Perceptual Loss": np.mean(perceptual_losses),
+                            "Codebook Loss": np.mean(codebook_losses),
+                            "Generator Loss": np.mean(gen_losses)})
+
             #####################################
             
             ######### Optimize Discriminator #######
