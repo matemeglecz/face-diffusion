@@ -10,15 +10,28 @@ from models.vqvae import VQVAE
 from models.lpips import LPIPS
 from models.discriminator import Discriminator
 from torch.utils.data.dataloader import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from dataset.mnist_dataset import MnistDataset
 from dataset.celeb_dataset import CelebDataset
 from torch.optim import Adam
 from torchvision.utils import make_grid
 import wandb
 from datetime import datetime
-from utils import dist_util
+import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 
+def setup(rank, world_size):
+    print('Setting up process group')
+    # Initialize the process group for distributed training
+    dist.init_process_group(
+        backend='nccl',     # Use 'gloo' for CPU and 'nccl' for GPU
+        init_method='env://',
+        world_size=world_size,
+        rank=rank
+    )
+
+def cleanup():
+    dist.destroy_process_group()
 
 def setup_wandb(config):
     wandb.init(project="Face-diffusion", entity="megleczmate", sync_tensorboard=True, tags=["vqvae"])
@@ -30,7 +43,7 @@ def setup_wandb(config):
     wandb.config.update(config)
     return wandb
 
-def train(args):
+def train(rank, world_size, args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Read the config file #
     with open(args.config_path, 'r') as file:
@@ -41,8 +54,8 @@ def train(args):
     print(config)
 
     wandb = setup_wandb(config)
-    dist_util.setup_dist()
 
+    setup(rank, world_size)
 
     dataset_config = config['dataset_params']
     autoencoder_config = config['autoencoder_params']
@@ -58,7 +71,7 @@ def train(args):
     #############################
 
     if train_config['distributed_data_paralell']:
-        device = dist_util.dev()
+        device = rank
 
     # Create the model and dataset #
     model_base = VQVAE(im_channels=dataset_config['im_channels'],
@@ -67,11 +80,7 @@ def train(args):
     if train_config['distributed_data_paralell']:
         model = DDP(
                 model_base,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
+                device_ids=[rank],
             )
     else:
         model = model_base
@@ -88,9 +97,12 @@ def train(args):
                                 im_size=dataset_config['im_size'],
                                 im_channels=dataset_config['im_channels'])
     
+    sampler = DistributedSampler(im_dataset, num_replicas=world_size, rank=rank)
+
     data_loader = DataLoader(im_dataset,
                              batch_size=train_config['autoencoder_batch_size'],
-                             shuffle=True)
+                             shuffle=True,
+                             sampler=sampler)
     
     # Create output directories
     if not os.path.exists(train_config['task_name']):
@@ -260,6 +272,8 @@ def train(args):
                                                     train_config['vqvae_autoencoder_ckpt_name']))
         torch.save(discriminator.state_dict(), os.path.join(train_config['task_name'],
                                                             train_config['vqvae_discriminator_ckpt_name']))
+    
+    cleanup()
     print('Done Training...')
 
 
@@ -268,4 +282,10 @@ if __name__ == '__main__':
     parser.add_argument('--config', dest='config_path',
                         default='config/mnist.yaml', type=str)
     args = parser.parse_args()
-    train(args)
+    
+    world_size = torch.cuda.device_count()  # Number of GPUs available
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    
+    # Launch one process per GPU
+    torch.multiprocessing.spawn(train, args=(world_size,args,), nprocs=world_size, join=True)
