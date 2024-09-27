@@ -16,8 +16,8 @@ from torch.optim import Adam
 from torchvision.utils import make_grid
 import wandb
 from datetime import datetime
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+from utils import dist_util
+from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 
 
 def setup_wandb(config):
@@ -31,6 +31,7 @@ def setup_wandb(config):
     return wandb
 
 def train(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Read the config file #
     with open(args.config_path, 'r') as file:
         try:
@@ -40,7 +41,9 @@ def train(args):
     print(config)
 
     wandb = setup_wandb(config)
-    
+    dist_util.setup_dist()
+
+
     dataset_config = config['dataset_params']
     autoencoder_config = config['autoencoder_params']
     train_config = config['train_params']
@@ -53,10 +56,27 @@ def train(args):
     if device == 'cuda':
         torch.cuda.manual_seed_all(seed)
     #############################
-    
+
+    if train_config['distributed_data_paralell']:
+        device = dist_util.dev()
+
     # Create the model and dataset #
-    model = VQVAE(im_channels=dataset_config['im_channels'],
+    model_base = VQVAE(im_channels=dataset_config['im_channels'],
                   model_config=autoencoder_config).to(device)
+    
+    if train_config['distributed_data_paralell']:
+        model = DDP(
+                model_base,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
+    else:
+        model = model_base
+        
+
     # Create the dataset
     im_dataset_cls = {
         'mnist': MnistDataset,
@@ -113,7 +133,7 @@ def train(args):
         optimizer_g.zero_grad()
         optimizer_d.zero_grad()
         
-        for im in tqdm(data_loader):
+        for im in tqdm(data_loader, ascii=True):
             step_count += 1
             im = im.float().to(device)
             
