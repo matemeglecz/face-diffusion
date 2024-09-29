@@ -8,6 +8,7 @@ from PIL import Image
 from utils.diffusion_utils import load_latents
 from tqdm import tqdm
 from torch.utils.data.dataset import Dataset
+import pandas as pd
 
 
 class CelebDataset(Dataset):
@@ -18,7 +19,7 @@ class CelebDataset(Dataset):
     """
     
     def __init__(self, split, im_path, im_size=256, im_channels=3, im_ext='jpg',
-                 use_latents=False, latent_path=None, condition_config=None):
+                 use_latents=False, latent_path=None, condition_config=None, classification=False):
         self.split = split
         self.im_size = im_size
         self.im_channels = im_channels
@@ -26,6 +27,7 @@ class CelebDataset(Dataset):
         self.im_path = im_path
         self.latent_maps = None
         self.use_latents = False
+        self.classification = classification
         
         self.condition_types = [] if condition_config is None else condition_config['condition_types']
         
@@ -36,8 +38,19 @@ class CelebDataset(Dataset):
             self.mask_channels = condition_config['image_condition_config']['image_condition_input_channels']
             self.mask_h = condition_config['image_condition_config']['image_condition_h']
             self.mask_w = condition_config['image_condition_config']['image_condition_w']
+
+        if 'attribute' in self.condition_types:
+            self.attribute_num = condition_config['attribute_condition_config']['attribute_condition_num']
+            self.selected_attrs = condition_config['attribute_condition_config']['attribute_condition_selected_attrs']
+
+            # load the attribute file
+            attr_path = os.path.join(im_path, 'CelebAMask-HQ-attribute-anno.txt')
+            attr_df = pd.read_csv(attr_path, sep='\s+', header=1)
+            # replace -1 with 0
+            attr_df = attr_df.replace(-1, 0)
+            self.attr_df = attr_df[self.selected_attrs]
             
-        self.images, self.texts, self.masks = self.load_images(im_path)
+        self.images, self.texts, self.masks, self.attributes = self.load_images(im_path)
         
         # Whether to load images or to load latents
         if use_latents and latent_path is not None:
@@ -61,6 +74,7 @@ class CelebDataset(Dataset):
         fnames += glob.glob(os.path.join(im_path, 'CelebA-HQ-img/*.{}'.format('jpeg')))
         texts = []
         masks = []
+        attributes = []
         
         if 'image' in self.condition_types:
             label_list = ['skin', 'nose', 'eye_g', 'l_eye', 'r_eye', 'l_brow', 'r_brow', 'l_ear', 'r_ear', 'mouth',
@@ -85,31 +99,45 @@ class CelebDataset(Dataset):
             if 'image' in self.condition_types:
                 im_name = int(os.path.split(fname)[1].split('.')[0])
                 masks.append(os.path.join(im_path, 'CelebAMask-HQ-mask', '{}.png'.format(im_name)))
+
+            if 'attribute' in self.condition_types:
+                im_name = int(os.path.split(fname)[1].split('.')[0])
+                attr = self.attr_df.iloc[im_name]
+                attr = attr.to_numpy()
+                attributes.append(attr)
+
         if 'text' in self.condition_types:
             assert len(texts) == len(ims), "Condition Type Text but could not find captions for all images"
         if 'image' in self.condition_types:
             assert len(masks) == len(ims), "Condition Type Image but could not find masks for all images"
+        if 'attribute' in self.condition_types:
+            assert len(attributes) == len(ims), "Condition Type Attribute but could not find attributes for all images"
+
         print('Found {} images'.format(len(ims)))
         print('Found {} masks'.format(len(masks)))
         print('Found {} captions'.format(len(texts)))
+        print('Found {} attributes'.format(len(attributes)))
 
         # split the data into train, test and validation
         if self.split == 'train':
             ims = ims[:int(0.9*len(ims))]
             texts = texts[:int(0.9*len(texts))]
             masks = masks[:int(0.9*len(masks))]
+            attributes = attributes[:int(0.9*len(attributes))]
         elif self.split == 'test':
             ims = ims[int(0.9*len(ims)):0.98*len(ims)]
             texts = texts[int(0.9*len(texts)):0.98*len(ims)]
             masks = masks[int(0.9*len(masks)):0.98*len(ims)]
+            attributes = attributes[int(0.9*len(attributes)):0.98*len(ims)]
         else:
             ims = ims[int(0.98*len(ims)):]
             texts = texts[int(0.98*len(texts)):]
             masks = masks[int(0.98*len(masks)):]
+            attributes = attributes[int(0.98*len(attributes)):]
 
 
-        return ims, texts, masks
-    
+        return ims, texts, masks, attributes
+
     def get_mask(self, index):
         r"""
         Method to get the mask of WxH
@@ -137,6 +165,9 @@ class CelebDataset(Dataset):
         if 'image' in self.condition_types:
             mask = self.get_mask(index)
             cond_inputs['image'] = mask
+        if 'attribute' in self.condition_types:
+            cond_inputs['attribute'] = self.attributes[index]
+
         #######################################
         
         if self.use_latents:
@@ -144,14 +175,24 @@ class CelebDataset(Dataset):
             if len(self.condition_types) == 0:
                 return latent
             else:
-                return latent, cond_inputs
-        else:
+                return latent, cond_inputs    
+        else:           
             im = Image.open(self.images[index])
-            im_tensor = torchvision.transforms.Compose([
-                torchvision.transforms.Resize(self.im_size),
-                torchvision.transforms.CenterCrop(self.im_size),
-                torchvision.transforms.ToTensor(),
-            ])(im)
+
+            if not self.classification:
+                im_tensor = torchvision.transforms.Compose([
+                    torchvision.transforms.Resize(self.im_size),
+                    torchvision.transforms.CenterCrop(self.im_size),
+                    torchvision.transforms.ToTensor(),
+                ])(im)
+            else:
+                im_tensor = torchvision.transforms.Compose([
+                    torchvision.transforms.Resize((256, 256)),
+                    torchvision.transforms.RandomHorizontalFlip(),
+                    torchvision.transforms.ToTensor(),
+                    torchvision.transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                ])(im)
+
             im.close()
         
             # Convert input to -1 to 1 range.

@@ -49,7 +49,7 @@ def setup_wandb(config):
     return wandb
 
 def train(rank, world_size, args):
-    print(f"Running basic DDP example on rank {rank}.")
+    print(f"Running DDP on rank {rank}.")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Read the config file #
     with open(args.config_path, 'r') as file:

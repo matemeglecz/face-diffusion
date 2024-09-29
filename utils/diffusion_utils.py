@@ -44,3 +44,11 @@ def drop_class_condition(class_condition, class_drop_prob, im):
         return class_condition * class_drop_mask
     else:
         return class_condition
+    
+def drop_attribute_condition(attribute_condition, attribute_drop_prob, im):
+    if attribute_drop_prob > 0:
+        attribute_drop_mask = torch.zeros((im.shape[0], 1), device=im.device).float().uniform_(0,
+                                                                                           1) > attribute_drop_prob
+        return attribute_condition * attribute_drop_mask
+    else:
+        return attribute_condition

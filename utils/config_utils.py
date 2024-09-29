@@ -20,7 +20,14 @@ def validate_image_config(condition_config):
         "image_condition_input_channels missing in image condition config"
     assert 'image_condition_output_channels' in condition_config['image_condition_config'], \
         "image_condition_output_channels missing in image condition config"
-    
+
+def validate_attribute_config(condition_config):
+    assert 'attribute_condition_config' in condition_config, \
+        "Attribute conditioning desired but attribute condition config missing"
+    assert 'attribute_condition_num' in condition_config['attribute_condition_config'], \
+        "attribute_condition_num missing in attribute condition config"
+    assert 'attribute_condition_selected_attrs' in condition_config['attribute_condition_config'], \
+        "attribute_condition_selected_attrs missing in attribute condition config"
 
 def validate_image_conditional_input(cond_input, x):
     assert 'image' in cond_input, \
@@ -36,5 +43,12 @@ def validate_class_conditional_input(cond_input, x, num_classes):
         "Model initialized with class conditioning but cond_input has no class information"
     assert cond_input['class'].shape == (x.shape[0], num_classes), \
         "Shape of class condition input must match (Batch Size, )"
+    
+def validate_attribute_conditional_input(cond_input, x, num_attributes):
+    assert 'attribute' in cond_input, \
+        "Model initialized with attribute conditioning but cond_input has no attribute information"
+    assert cond_input['attribute'].shape == (x.shape[0], num_attributes), \
+        "Shape of attribute condition input must match (Batch Size, )"
+
 def get_config_value(config, key, default_value):
     return config[key] if key in config else default_value

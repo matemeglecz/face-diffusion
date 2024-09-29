@@ -6,6 +6,7 @@ from torch.optim import Adam
 from dataset.mnist_dataset import MnistDataset
 from dataset.celeb_dataset import CelebDataset
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from models.unet_cond_base import Unet
 from models.vqvae import VQVAE
 from scheduler.linear_noise_scheduler import LinearNoiseScheduler
@@ -15,21 +16,40 @@ from utils.diffusion_utils import *
 import wandb
 import os
 from datetime import datetime
+import torch.distributed as dist
+from torch.nn.parallel.distributed import DistributedDataParallel as DDP
+import socket
+from mpi4py import MPI
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def setup(rank, world_size):
+    print('Setting up process group')
+    #torch.cuda.set_device(rank)
+    # Initialize the process group for distributed training
+    dist.init_process_group(
+        backend='nccl',     # Use 'gloo' for CPU and 'nccl' for GPU
+        init_method='env://',
+        world_size=world_size,
+        rank=rank,
+    )
+
+    print("setup finished")
+
+def cleanup():
+    dist.destroy_process_group()
 
 def setup_wandb(config):
-    wandb.init(project='ddpm', config=config)
+    wandb.init(project="Face-diffusion", entity="megleczmate", sync_tensorboard=True, tags=["ddpm"])
     # get current time
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
-    wandb.run.name = config['task_name'] + '_' + current_time
+    wandb.run.name = config['task_name'] + '_cond_ddpm_' + '_' + current_time
     wandb.run.save()
     wandb.config.update(config)
     return wandb
 
 
-def train(args):
+def train(rank, world_size, args):
+    print(f"Running DDP on rank {rank}.")
     # Read the config file #
     with open(args.config_path, 'r') as file:
         try:
@@ -37,6 +57,12 @@ def train(args):
         except yaml.YAMLError as exc:
             print(exc)
     print(config)
+
+    if rank == 0:
+        wandb = setup_wandb(config)
+
+    setup(rank, world_size)
+
     ########################
     
     diffusion_config = config['diffusion_params']
@@ -44,6 +70,12 @@ def train(args):
     diffusion_model_config = config['ldm_params']
     autoencoder_model_config = config['autoencoder_params']
     train_config = config['train_params']
+
+
+    #############################
+
+    if train_config['distributed_data_paralell']:
+        device = rank
     
     ########## Create the noise scheduler #############
     scheduler = LinearNoiseScheduler(num_timesteps=diffusion_config['num_timesteps'],
@@ -82,23 +114,47 @@ def train(args):
                                 use_latents=True,
                                 latent_path=os.path.join(train_config['task_name'],
                                                          train_config['vqvae_latent_dir_name']),
-                                condition_config=condition_config)
+                                condition_config=condition_config,
+                                )
     
+    sampler = DistributedSampler(im_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+
     data_loader = DataLoader(im_dataset,
                              batch_size=train_config['ldm_batch_size'],
-                             shuffle=True)
+                             shuffle=False,
+                             sampler=sampler,
+                             num_workers=4)
     
     # Instantiate the unet model
-    model = Unet(im_channels=autoencoder_model_config['z_channels'],
+    model_base = Unet(im_channels=autoencoder_model_config['z_channels'],
                  model_config=diffusion_model_config).to(device)
+    
+    if train_config['distributed_data_paralell']:
+        model = DDP(
+                model_base,
+                device_ids=[rank],
+            )
+    else:
+        model = model_base
+    
+    
     model.train()
     
     vae = None
     # Load VAE ONLY if latents are not to be saved or some are missing
     if not im_dataset.use_latents:
         print('Loading vqvae model as latents not present')
-        vae = VQVAE(im_channels=dataset_config['im_channels'],
+        vae_base = VQVAE(im_channels=dataset_config['im_channels'],
                     model_config=autoencoder_model_config).to(device)
+        
+        if train_config['distributed_data_paralell']:
+            vae = DDP(
+                vae_base,
+                device_ids=[rank],
+            )
+        else:
+            vae = vae_base
+
         vae.eval()
         # Load vae if found
         if os.path.exists(os.path.join(train_config['task_name'],
@@ -120,11 +176,16 @@ def train(args):
         assert vae is not None
         for param in vae.parameters():
             param.requires_grad = False
+
+    log_step_steps_wandb = train_config['ddpm_log_step_steps_wandb']
+    wandb_image_save_steps = train_config['ddpm_img_save_steps_wandb']
     
+    step = 0
+
     # Run training
     for epoch_idx in range(num_epochs):
         losses = []
-        for data in tqdm(data_loader):
+        for data in tqdm(data_loader, ascii=True):
             cond_input = None
             if condition_config is not None:
                 im, cond_input = data
@@ -167,6 +228,16 @@ def train(args):
                                                    'cond_drop_prob', 0.)
                 # Drop condition
                 cond_input['class'] = drop_class_condition(class_condition, class_drop_prob, im)
+            if 'attribute' in condition_types:
+                assert 'attribute' in cond_input, 'Conditioning Type Attribute but no attribute conditioning input present'
+                validate_attribute_config(condition_config)
+                attribute_condition = cond_input['attribute'].to(device)
+                attribute_drop_prob = get_config_value(condition_config['attribute_condition_config'],
+                                                   'cond_drop_prob', 0.)
+                # Drop condition
+                # we dont drop attributes
+                #cond_input['attribute'] = drop_attribute_condition(attribute_condition, attribute_drop_prob, im)
+
             ################################################
             
             # Sample random noise
@@ -182,18 +253,63 @@ def train(args):
             losses.append(loss.item())
             loss.backward()
             optimizer.step()
+
+            step += 1
+
+
+            if (step % log_step_steps_wandb == 0 or step == 1) and rank == 0:
+                wandb.log({'loss': loss.item(), 'epoch': epoch_idx, 'step': step})
+
+            if (step % wandb_image_save_steps == 0 or step == 1) and rank == 0:
+                with torch.no_grad():
+                    im_save = scheduler.add_noise(im, noise, t)
+                    noisy_im_save = scheduler.add_noise(im, noise, t)
+                    noise_pred_save = model(noisy_im_save, t, cond_input=cond_input)
+                    wandb.log({'original_image': [wandb.Image(im_save[0].cpu().detach().numpy())],
+                               'noisy_image': [wandb.Image(noisy_im_save[0].cpu().detach().numpy())],
+                               'reconstructed_image': [wandb.Image(noise_pred_save[0].cpu().detach().numpy())]})
+
+
         print('Finished epoch:{} | Loss : {:.4f}'.format(
             epoch_idx + 1,
             np.mean(losses)))
-        torch.save(model.state_dict(), os.path.join(train_config['task_name'],
+        
+        if rank == 0:
+            torch.save(model.state_dict(), os.path.join(train_config['task_name'],
                                                     train_config['ldm_ckpt_name']))
     
+    cleanup()
     print('Done Training ...')
 
+def _find_free_port():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
+    finally:
+        s.close()
 
 if __name__ == '__main__':
+    os.environ["NCCL_DEBUG"] = "INFO"
     parser = argparse.ArgumentParser(description='Arguments for ddpm training')
     parser.add_argument('--config', dest='config_path',
-                        default='config/celebhq_text_cond_clip.yaml', type=str)
+                        default='config/celebhq_attribute_cond.yaml', type=str)
     args = parser.parse_args()
-    train(args)
+    
+    comm = MPI.COMM_WORLD
+
+    hostname = socket.gethostbyname(socket.getfqdn())
+
+    world_size = torch.cuda.device_count()  # Number of GPUs available
+
+    print(world_size)
+
+    os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
+    port = comm.bcast(_find_free_port(), root=0)
+    os.environ["MASTER_PORT"] = str(port)
+
+    print(hostname, port)
+    
+    # Launch one process per GPU
+    torch.multiprocessing.spawn(train, args=(world_size,args), nprocs=world_size, join=True)

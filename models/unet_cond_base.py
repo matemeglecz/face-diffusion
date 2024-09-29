@@ -36,6 +36,7 @@ class Unet(nn.Module):
         self.class_cond = False
         self.text_cond = False
         self.image_cond = False
+        self.attribute_cond = False
         self.text_embed_dim = None
         self.condition_config = get_config_value(model_config, 'condition_config', None)
         if self.condition_config is not None:
@@ -55,11 +56,19 @@ class Unet(nn.Module):
                     'image_condition_input_channels']
                 self.im_cond_output_ch = self.condition_config['image_condition_config'][
                     'image_condition_output_channels']
+            if 'attribute' in condition_types:
+                self.attribute_cond = True
+                self.attribute_condition_num = self.condition_config['attribute_condition_config']['attribute_condition_num']
+                self.attribute_condition_selected_attrs = self.condition_config['attribute_condition_config']['attribute_condition_selected_attrs']
         if self.class_cond:
             # Rather than using a special null class we dont add the
             # class embedding information for unconditional generation
             self.class_emb = nn.Embedding(self.num_classes,
                                           self.t_emb_dim)
+            
+        if self.attribute_cond:
+            self.attribute_emb = nn.Embedding(self.attribute_condition_num,
+                                              self.t_emb_dim)
         
         if self.image_cond:
             # Map the mask image to a N channel image and
@@ -72,7 +81,7 @@ class Unet(nn.Module):
                                             self.down_channels[0], kernel_size=3, padding=1)
         else:
             self.conv_in = nn.Conv2d(im_channels, self.down_channels[0], kernel_size=3, padding=1)
-        self.cond = self.text_cond or self.image_cond or self.class_cond
+        self.cond = self.text_cond or self.image_cond or self.class_cond or self.attribute_cond
         ###################################
         
         # Initial projection from sinusoidal time embedding
@@ -154,7 +163,13 @@ class Unet(nn.Module):
             class_embed = einsum(cond_input['class'].float(), self.class_emb.weight, 'b n, n d -> b d')
             t_emb += class_embed
         ####################################
-            
+        
+        ######## Attribute Conditioning ########
+        if self.attribute_cond:
+            validate_attribute_conditional_input(cond_input, x, self.attribute_condition_num)
+            attribute_embed = einsum(cond_input['attribute'].float(), self.attribute_emb.weight, 'b n, n d -> b d')
+            t_emb += attribute_embed
+
         context_hidden_states = None
         if self.text_cond:
             assert 'text' in cond_input, \
