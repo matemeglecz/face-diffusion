@@ -19,16 +19,21 @@ import wandb
 from datetime import datetime
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
+import socket
+from mpi4py import MPI
 
 def setup(rank, world_size):
     print('Setting up process group')
+    #torch.cuda.set_device(rank)
     # Initialize the process group for distributed training
     dist.init_process_group(
         backend='nccl',     # Use 'gloo' for CPU and 'nccl' for GPU
         init_method='env://',
         world_size=world_size,
-        rank=rank
+        rank=rank,
     )
+
+    print("setup finished")
 
 def cleanup():
     dist.destroy_process_group()
@@ -44,6 +49,7 @@ def setup_wandb(config):
     return wandb
 
 def train(rank, world_size, args):
+    print(f"Running basic DDP example on rank {rank}.")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Read the config file #
     with open(args.config_path, 'r') as file:
@@ -53,7 +59,8 @@ def train(rank, world_size, args):
             print(exc)
     print(config)
 
-    wandb = setup_wandb(config)
+    if rank == 0:
+        wandb = setup_wandb(config)
 
     setup(rank, world_size)
 
@@ -101,7 +108,7 @@ def train(rank, world_size, args):
 
     data_loader = DataLoader(im_dataset,
                              batch_size=train_config['autoencoder_batch_size'],
-                             shuffle=True,
+                             shuffle=False,
                              sampler=sampler)
     
     # Create output directories
@@ -116,7 +123,7 @@ def train(rank, world_size, args):
     disc_criterion = torch.nn.MSELoss()
     
     # No need to freeze lpips as lpips.py takes care of that
-    lpips_model = LPIPS().eval().to(device)
+    lpips_model = LPIPS(device='cuda').eval().to(device)
     discriminator = Discriminator(im_channels=dataset_config['im_channels']).to(device)
     
     optimizer_d = Adam(discriminator.parameters(), lr=train_config['autoencoder_lr'], betas=(0.5, 0.999))
@@ -170,7 +177,7 @@ def train(rank, world_size, args):
                 img.close()
 
             # Save images to wandb
-            if step_count % wandb_image_save_steps == 0 or step_count == 1:
+            if (step_count % wandb_image_save_steps == 0 or step_count == 1) and rank == 0:
                 sample_size = min(8, im.shape[0])
                 save_output = torch.clamp(output[:sample_size], -1., 1.).detach().cpu()
                 save_output = ((save_output + 1) / 2)
@@ -203,7 +210,7 @@ def train(rank, world_size, args):
             g_loss.backward()
 
             # log the losses in every 500 steps
-            if step_count % log_step_steps_wandb == 0 or step_count == 1:
+            if (step_count % log_step_steps_wandb == 0 or step_count == 1) and rank == 0:
                 wandb.log({ "Step": step_count,
                             "Recon Loss": np.mean(recon_losses),
                             "Perceptual Loss": np.mean(perceptual_losses),
@@ -239,53 +246,74 @@ def train(rank, world_size, args):
         optimizer_d.zero_grad()
         optimizer_g.step()
         optimizer_g.zero_grad()
-        if len(disc_losses) > 0:
-            print(
-                'Finished epoch: {} | Recon Loss : {:.4f} | Perceptual Loss : {:.4f} | '
-                'Codebook : {:.4f} | G Loss : {:.4f} | D Loss {:.4f}'.
-                format(epoch_idx + 1,
-                       np.mean(recon_losses),
-                       np.mean(perceptual_losses),
-                       np.mean(codebook_losses),
-                       np.mean(gen_losses),
-                       np.mean(disc_losses)))
-            wandb.log({ "Epoch": epoch_idx + 1,
-                        "Recon Loss": np.mean(recon_losses),
-                        "Perceptual Loss": np.mean(perceptual_losses),
-                        "Codebook Loss": np.mean(codebook_losses),
-                        "Generator Loss": np.mean(gen_losses),
-                        "Discriminator Loss": np.mean(disc_losses)})
-        else:
-            print('Finished epoch: {} | Recon Loss : {:.4f} | Perceptual Loss : {:.4f} | Codebook : {:.4f}'.
-                  format(epoch_idx + 1,
-                         np.mean(recon_losses),
-                         np.mean(perceptual_losses),
-                         np.mean(codebook_losses)))
-            wandb.log({ "Epoch": epoch_idx + 1,
-                           "Recon Loss": np.mean(recon_losses),
+        if rank == 0:
+            if len(disc_losses) > 0:
+                print(
+                    'Finished epoch: {} | Recon Loss : {:.4f} | Perceptual Loss : {:.4f} | '
+                    'Codebook : {:.4f} | G Loss : {:.4f} | D Loss {:.4f}'.
+                    format(epoch_idx + 1,
+                        np.mean(recon_losses),
+                        np.mean(perceptual_losses),
+                        np.mean(codebook_losses),
+                        np.mean(gen_losses),
+                        np.mean(disc_losses)))
+                wandb.log({ "Epoch": epoch_idx + 1,
+                            "Recon Loss": np.mean(recon_losses),
                             "Perceptual Loss": np.mean(perceptual_losses),
-                            "Codebook Loss": np.mean(codebook_losses)})    
+                            "Codebook Loss": np.mean(codebook_losses),
+                            "Generator Loss": np.mean(gen_losses),
+                            "Discriminator Loss": np.mean(disc_losses)})
+            else:
+                print('Finished epoch: {} | Recon Loss : {:.4f} | Perceptual Loss : {:.4f} | Codebook : {:.4f}'.
+                    format(epoch_idx + 1,
+                            np.mean(recon_losses),
+                            np.mean(perceptual_losses),
+                            np.mean(codebook_losses)))
+                wandb.log({ "Epoch": epoch_idx + 1,
+                            "Recon Loss": np.mean(recon_losses),
+                                "Perceptual Loss": np.mean(perceptual_losses),
+                                "Codebook Loss": np.mean(codebook_losses)})    
         
 
+        if rank == 0:
+            torch.save(model.state_dict(), os.path.join(train_config['task_name'],
+                                                        train_config['vqvae_autoencoder_ckpt_name']))
+            torch.save(discriminator.state_dict(), os.path.join(train_config['task_name'],
+                                                                train_config['vqvae_discriminator_ckpt_name']))
         
-        torch.save(model.state_dict(), os.path.join(train_config['task_name'],
-                                                    train_config['vqvae_autoencoder_ckpt_name']))
-        torch.save(discriminator.state_dict(), os.path.join(train_config['task_name'],
-                                                            train_config['vqvae_discriminator_ckpt_name']))
-    
     cleanup()
     print('Done Training...')
 
 
+def _find_free_port():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
 if __name__ == '__main__':
+    os.environ["NCCL_DEBUG"] = "INFO"
     parser = argparse.ArgumentParser(description='Arguments for vq vae training')
     parser.add_argument('--config', dest='config_path',
                         default='config/mnist.yaml', type=str)
     args = parser.parse_args()
     
+    comm = MPI.COMM_WORLD
+
+    hostname = socket.gethostbyname(socket.getfqdn())
+
     world_size = torch.cuda.device_count()  # Number of GPUs available
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+
+    print(world_size)
+
+    os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
+    port = comm.bcast(_find_free_port(), root=0)
+    os.environ["MASTER_PORT"] = str(port)
+
+    print(hostname, port)
     
     # Launch one process per GPU
-    torch.multiprocessing.spawn(train, args=(world_size,args,), nprocs=world_size, join=True)
+    torch.multiprocessing.spawn(train, args=(world_size,args), nprocs=world_size, join=True)
