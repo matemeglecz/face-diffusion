@@ -38,12 +38,21 @@ def setup(rank, world_size):
 def cleanup():
     dist.destroy_process_group()
 
-def setup_wandb(config):
+def setup_wandb(config, api=''):
+    if api != '':
+        wandb.login(key=api)
+
     wandb.init(project="Face-diffusion", entity="megleczmate", sync_tensorboard=True, tags=["vqvae"])
     # get current time
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
-    wandb.run.name = config['task_name'] + '_' + current_time
+    wandb.run.name = config['task_name']
+
+    if config['continue']:
+    	wandb.run.name = wandb.run.name + '_continue' 
+  
+    wandb.run.name = wandb.run.name + '_' + current_time
+
     wandb.run.save()
     wandb.config.update(config)
     return wandb
@@ -60,7 +69,7 @@ def train(rank, world_size, args):
     print(config)
 
     if rank == 0:
-        wandb = setup_wandb(config)
+        wandb = setup_wandb(config, args.api)
 
     setup(rank, world_size)
 
@@ -91,6 +100,13 @@ def train(rank, world_size, args):
             )
     else:
         model = model_base
+
+    if config['continue']:
+        #ckpt name
+        name = str(config['last_epoch']) + '_' + train_config['vqvae_autoencoder_ckpt_name']
+
+        model.load_state_dict(torch.load(os.path.join('/project/c_mrisdm/conditional_stable_diffusion/face-diffusion',train_config['task_name'],
+                                                        name)))
         
 
     # Create the dataset
@@ -112,7 +128,7 @@ def train(rank, world_size, args):
                              sampler=sampler)
     
     # Create output directories
-    if not os.path.exists(train_config['task_name']):
+    if not os.path.exists(train_config['task_name']) and rank==0:
         os.mkdir(train_config['task_name'])
         
     num_epochs = train_config['autoencoder_epochs']
@@ -124,13 +140,32 @@ def train(rank, world_size, args):
     
     # No need to freeze lpips as lpips.py takes care of that
     lpips_model = LPIPS(device='cuda').eval().to(device)
-    discriminator = Discriminator(im_channels=dataset_config['im_channels']).to(device)
+    discriminator = Discriminator(im_channels=dataset_config['im_channels'])
+
+    if config['continue']:
+        #ckpt name
+        name = str(config['last_epoch']) + '_' + train_config['vqvae_discriminator_ckpt_name']
+
+        discriminator.load_state_dict(torch.load(os.path.join('/project/c_mrisdm/conditional_stable_diffusion/face-diffusion', train_config['task_name'],
+                                                        name)))
+
+    discriminator = discriminator.to(device)
     
     optimizer_d = Adam(discriminator.parameters(), lr=train_config['autoencoder_lr'], betas=(0.5, 0.999))
     optimizer_g = Adam(model.parameters(), lr=train_config['autoencoder_lr'], betas=(0.5, 0.999))
     
     disc_step_start = train_config['disc_start']
+
     step_count = 0
+
+    if config['continue']:
+        step_count = config['last_step'] + 1
+
+    start_epoch = 0
+
+    if config['continue']:
+        start_epoch = config['last_epoch'] + 1
+
     
     # This is for accumulating gradients incase the images are huge
     # And one cant afford higher batch sizes
@@ -139,8 +174,10 @@ def train(rank, world_size, args):
     wandb_image_save_steps = train_config['autoencoder_img_save_steps_wandb']
     log_step_steps_wandb = train_config['autoencoder_log_step_steps_wandb']
     img_save_count = 0
+
+    torch.cuda.empty_cache()
     
-    for epoch_idx in range(num_epochs):
+    for epoch_idx in range(start_epoch, num_epochs):
         recon_losses = []
         codebook_losses = []
         #commitment_losses = []
@@ -169,7 +206,7 @@ def train(rank, world_size, args):
                 
                 grid = make_grid(torch.cat([save_input, save_output], dim=0), nrow=sample_size)
                 img = torchvision.transforms.ToPILImage()(grid)
-                if not os.path.exists(os.path.join(train_config['task_name'],'vqvae_autoencoder_samples')):
+                if not os.path.exists(os.path.join(train_config['task_name'],'vqvae_autoencoder_samples')) and rank==0:
                     os.mkdir(os.path.join(train_config['task_name'], 'vqvae_autoencoder_samples'))
                 img.save(os.path.join(train_config['task_name'],'vqvae_autoencoder_samples',
                                       'current_autoencoder_sample_{}.png'.format(img_save_count)))
@@ -276,10 +313,11 @@ def train(rank, world_size, args):
         
 
         if rank == 0:
+            file_name_prefix = str(epoch_idx) + '_'
             torch.save(model.state_dict(), os.path.join(train_config['task_name'],
-                                                        train_config['vqvae_autoencoder_ckpt_name']))
+                                                        file_name_prefix + train_config['vqvae_autoencoder_ckpt_name']))
             torch.save(discriminator.state_dict(), os.path.join(train_config['task_name'],
-                                                                train_config['vqvae_discriminator_ckpt_name']))
+                                                                file_name_prefix + train_config['vqvae_discriminator_ckpt_name']))
         
     cleanup()
     print('Done Training...')
@@ -299,6 +337,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Arguments for vq vae training')
     parser.add_argument('--config', dest='config_path',
                         default='config/mnist.yaml', type=str)
+    parser.add_argument('--api', default='', type=str)
     args = parser.parse_args()
     
     comm = MPI.COMM_WORLD
