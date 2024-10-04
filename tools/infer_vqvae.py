@@ -13,6 +13,7 @@ from tqdm import tqdm
 from dataset.celeb_dataset import CelebDataset
 from dataset.mnist_dataset import MnistDataset
 from models.vqvae import VQVAE
+from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -56,9 +57,20 @@ def infer(args):
     
     model = VQVAE(im_channels=dataset_config['im_channels'],
                   model_config=autoencoder_config).to(device)
-    model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
-                                                    train_config['vqvae_autoencoder_ckpt_name']),
-                                     map_location=device))
+
+
+    from collections import OrderedDict
+
+    ddp_state_dict = torch.load(os.path.join('/workspace/face-diffusion/',train_config['task_name'],
+                                                    train_config['vqvae_autoencoder_ckpt_name']), map_location=device)
+    '''
+    new_state_dict = OrderedDict()
+    for k, v in ddp_state_dict.items():
+        name = k[7:] # remove `module.`
+        new_state_dict[name] = v
+'''
+    new_state_dict = ddp_state_dict
+    model.load_state_dict(new_state_dict)
     model.eval()
     
     with torch.no_grad():
@@ -83,6 +95,7 @@ def infer(args):
         decoder_grid.save(os.path.join(train_config['task_name'], 'reconstructed_samples.png'))
         
         if train_config['save_latents']:
+            print("Saving latents")
             # save Latents (but in a very unoptimized way)
             latent_path = os.path.join(train_config['task_name'], train_config['vqvae_latent_dir_name'])
             latent_fnames = glob.glob(os.path.join(train_config['task_name'], train_config['vqvae_latent_dir_name'],
@@ -95,7 +108,7 @@ def infer(args):
             fname_latent_map = {}
             part_count = 0
             count = 0
-            for idx, im in enumerate(tqdm(data_loader)):
+            for idx, im in enumerate(tqdm(data_loader, ascii=True)):
                 encoded_output, _ = model.encode(im.float().to(device))
                 fname_latent_map[im_dataset.images[idx]] = encoded_output.cpu()
                 # Save latents every 1000 images

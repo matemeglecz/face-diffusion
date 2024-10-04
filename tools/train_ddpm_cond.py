@@ -42,7 +42,13 @@ def setup_wandb(config):
     # get current time
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
-    wandb.run.name = config['task_name'] + '_cond_ddpm_' + '_' + current_time
+    wandb.run.name = config['task_name']
+
+    if config['continue']:
+    	wandb.run.name = wandb.run.name + '_continue' 
+  
+    wandb.run.name = wandb.run.name + '_' + current_time
+
     wandb.run.save()
     wandb.config.update(config)
     return wandb
@@ -122,8 +128,8 @@ def train(rank, world_size, args):
     data_loader = DataLoader(im_dataset,
                              batch_size=train_config['ldm_batch_size'],
                              shuffle=False,
-                             sampler=sampler,
-                             num_workers=4)
+                             sampler=sampler,)
+                             #num_workers=4)
     
     # Instantiate the unet model
     model_base = Unet(im_channels=autoencoder_model_config['z_channels'],
@@ -137,6 +143,12 @@ def train(rank, world_size, args):
     else:
         model = model_base
     
+    if config['continue']:
+        #ckpt name
+        name = train_config['ldm_ckpt_name']
+
+        model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
+                                                        name)))
     
     model.train()
     
@@ -182,8 +194,16 @@ def train(rank, world_size, args):
     
     step = 0
 
+    if config['continue']:
+        step = config['last_step'] + 1
+
+    start_epoch = 0
+
+    if config['continue']:
+        start_epoch = config['last_epoch'] + 1
+
     # Run training
-    for epoch_idx in range(num_epochs):
+    for epoch_idx in range(start_epoch, num_epochs):
         losses = []
         for data in tqdm(data_loader, ascii=True):
             cond_input = None
@@ -265,6 +285,12 @@ def train(rank, world_size, args):
                     im_save = scheduler.add_noise(im, noise, t)
                     noisy_im_save = scheduler.add_noise(im, noise, t)
                     noise_pred_save = model(noisy_im_save, t, cond_input=cond_input)
+
+                    # transpose to NHWC
+                    im_save = im_save.permute(0, 2, 3, 1)
+                    noisy_im_save = noisy_im_save.permute(0, 2, 3, 1)
+                    noise_pred_save = noise_pred_save.permute(0, 2, 3, 1)
+
                     wandb.log({'original_image': [wandb.Image(im_save[0].cpu().detach().numpy())],
                                'noisy_image': [wandb.Image(noisy_im_save[0].cpu().detach().numpy())],
                                'reconstructed_image': [wandb.Image(noise_pred_save[0].cpu().detach().numpy())]})
