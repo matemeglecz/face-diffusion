@@ -199,10 +199,6 @@ def _find_free_port():
 
 if __name__ == '__main__':
     os.environ["NCCL_DEBUG"] = "INFO"
-    parser = argparse.ArgumentParser(description='Arguments for ddpm training')
-    parser.add_argument('--config', dest='config_path',
-                        default='config/celebhq_attribute_cond.yaml', type=str)
-    args = parser.parse_args()
     
     comm = MPI.COMM_WORLD
 
