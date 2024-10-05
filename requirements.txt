@@ -45,4 +45,4 @@ zipp==3.16.2
 wandb
 tensorboard
 blobfile
-mpi4py
+pandas

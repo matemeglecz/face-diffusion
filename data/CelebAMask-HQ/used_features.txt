@@ -1,0 +1,43 @@
+Gender:
+Male
+Female
+
+Age:
+Young
+Not Young
+
+Hair stlye:
+Bald
+Bangs
+Receding_Hairline
+
+
+Hair color:
+Black_Hair
+Blond_Hair
+Brown_Hair
+Gray_Hair
+Straight_Hair 
+Wavy_Hair
+
+
+eyebrows stlye:
+Bushy_Eyebrows
+not Bushy_Eyebrows
+
+Facial hair style:
+No_Beard
+beard
+Goatee
+Mustache
+Sideburns
+
+
+Eyeglasses
+Heavy_Makeup
+ Wearing_Lipstick
+
+
+
+
+['Male', 'Young', 'Bald', 'Bangs', 'Receding_Hairline', 'Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Gray_Hair', 'Straight_Hair', 'Wavy_Hair', 'No_Beard', 'Goatee', 'Mustache', 'Sideburns', 'Narrow_Eyes', 'Oval_Face', 'Pale_Skin', 'Pointy_Nose']
