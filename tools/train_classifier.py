@@ -45,6 +45,9 @@ def train_model(model, criterion, optimizer, condition_config, world_size, rank,
     # Path to CelebA dataset
     data_dir = 'data/CelebAMask-HQ/'
 
+    if rank == 0:
+        wandb = setup_wandb(condition_config)
+
     # Load CelebA dataset with attribute labels
     image_datasets = {
         'train': CelebDataset(split='train',
@@ -67,7 +70,7 @@ def train_model(model, criterion, optimizer, condition_config, world_size, rank,
     }
 
     # Data loaders
-    batch_size = 96
+    batch_size = 64
     dataloaders = {
         'train': DataLoader(image_datasets['train'], batch_size=batch_size, sampler=samplers['train'], num_workers=4),
         'val': DataLoader(image_datasets['val'], batch_size=batch_size, sampler=samplers['val'], num_workers=4)
@@ -137,7 +140,8 @@ def train_model(model, criterion, optimizer, condition_config, world_size, rank,
                     for attr in condition_config['attribute_condition_config']['attribute_condition_selected_attrs']:
                         wandb.log({f'{attr}_accuracy': val_accuracies_per_attribute[attr] / dataset_sizes[phase]})
 
-
+    if rank == 0:
+        wandb.finish()
 
     return model
 
@@ -148,7 +152,7 @@ def main(rank, world_size):
                 'condition_types': [ 'attribute' ],
                 'attribute_condition_config': {
                     'attribute_condition_num': 3,
-                    'attribute_condition_selected_attrs': ['Male', 'Young', 'Bald', 'Bangs', 'Receding_Hairline', 'Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Gray_Hair', 'Straight_Hair', 'Wavy_Hair', 'No_Beard', 'Goatee', 'Mustache', 'Sideburns', 'Narrow_Eyes', 'Oval_Face', 'Pale_Skin', 'Pointy_Nose'],
+                    'attribute_condition_selected_attrs': ['Eyeglasses', 'Heavy_Makeup', 'Smiling'],
                     }
                 }
 
@@ -162,8 +166,8 @@ def main(rank, world_size):
     model.fc = nn.Linear(num_ftrs, condition_config['attribute_condition_config']['attribute_condition_num'])
 
     # Move model to GPU if available
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+    #device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = model.to(rank)
 
     model = DDP(model, device_ids=[rank])
 
@@ -172,17 +176,12 @@ def main(rank, world_size):
 
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-    if rank == 0:
-        wandb = setup_wandb(condition_config)
     # Train the model for 25 epochs
-    model = train_model(model, criterion, optimizer, condition_config, world_size, rank, num_epochs=10, wandb=wandb)
+    model = train_model(model, criterion, optimizer, condition_config, world_size, rank, num_epochs=100, wandb=None)
 
     if rank == 0:
         # Save the model
         torch.save(model.state_dict(), 'celeba_resnet18_attribute_classifier.pth')
-
-    if rank == 0:
-        wandb.finish()
     
     cleanup()
 
