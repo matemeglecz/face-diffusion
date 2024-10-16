@@ -125,10 +125,10 @@ class CelebDataset(Dataset):
             masks = masks[:int(0.9*len(masks))]
             attributes = attributes[:int(0.9*len(attributes))]
         elif self.split == 'test':
-            ims = ims[int(0.9*len(ims)):0.98*len(ims)]
-            texts = texts[int(0.9*len(texts)):0.98*len(ims)]
-            masks = masks[int(0.9*len(masks)):0.98*len(ims)]
-            attributes = attributes[int(0.9*len(attributes)):0.98*len(ims)]
+            ims = ims[int(0.9*len(ims)):int(0.98*len(ims))]
+            texts = texts[int(0.9*len(texts)):int(0.98*len(ims))]
+            masks = masks[int(0.9*len(masks)):int(0.98*len(ims))]
+            attributes = attributes[int(0.9*len(attributes)):int(0.98*len(attributes))]
         else:
             ims = ims[int(0.98*len(ims)):]
             texts = texts[int(0.98*len(texts)):]
