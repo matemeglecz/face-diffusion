@@ -19,6 +19,10 @@ __pycache__
 # Ignore pickle files
 *.pkl
 
+*.pt
+
+*.npy
+
 # Ignore wandb dir
 wandb
 
