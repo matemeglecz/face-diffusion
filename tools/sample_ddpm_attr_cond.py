@@ -17,15 +17,15 @@ from datetime import datetime
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def sample(model, scheduler, train_config, diffusion_model_config,
-           autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=False, noise_input=None):
+def sample(model, cond, scheduler, train_config, diffusion_model_config,
+           autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=False, start_step=0, num_steps=1000, noise_input=None, dir=''):
     r"""
     Sample stepwise by going backward one timestep at a time.
     We save the x0 predictions
     """
 
     # seed random for reproducibility
-    torch.manual_seed(9)
+    #torch.manual_seed(9)
 
     im_size = dataset_config['im_size'] // 2 ** sum(autoencoder_model_config['down_sample'])
     
@@ -56,7 +56,7 @@ def sample(model, scheduler, train_config, diffusion_model_config,
     cond_input = {
         # 'class': torch.nn.functional.one_hot(sample_classes, num_classes).to(device)
         #  ['Male', 'Young', 'Bald', 'Bangs', 'Receding_Hairline', 'Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Gray_Hair', 'Straight_Hair', 'Wavy_Hair', 'No_Beard', 'Goatee', 'Mustache', 'Sideburns', 'Narrow_Eyes', 'Oval_Face', 'Pale_Skin', 'Pointy_Nose']
-        'attribute': torch.tensor([[0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0]]).to(device)
+        'attribute': cond
 
     }
     # Unconditional input for classifier free guidance
@@ -70,11 +70,17 @@ def sample(model, scheduler, train_config, diffusion_model_config,
     cf_guidance_scale = get_config_value(train_config, 'cf_guidance_scale', 1.0)
     
     current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    if not use_ddim:
+        num_steps = diffusion_config['num_timesteps']
     
     ################# Sampling Loop ########################
-    for i in tqdm(reversed(range(diffusion_config['num_timesteps']))):
+    for i in tqdm(reversed(range(num_steps - start_step)), total=num_steps):
+        timestep = ((i-1) * (1000 // num_steps)) + 1
+        #print(timestep)
+        
         # Get prediction of noise
-        t = (torch.ones((xt.shape[0],))*i).long().to(device)
+        t = (torch.ones((xt.shape[0],))*timestep).long().to(device)
         noise_pred_cond = model(xt, t, cond_input)
         
         if cf_guidance_scale > 1:
@@ -85,7 +91,8 @@ def sample(model, scheduler, train_config, diffusion_model_config,
         
         # If DDIM is enabled, we need to also compute t_prev for the DDIM reverse process
         if use_ddim:
-            t_prev = (torch.ones((xt.shape[0],)) * max(i - 1, 0)).long().to(device)
+            timestep_prev = max(timestep - (1000 // num_steps), 1)
+            t_prev = (torch.ones((xt.shape[0],)).to(device) * max(timestep - (1000 // num_steps), 1)).long().to(device)
             xt, x0_pred = scheduler.sample_prev_timestep(xt, noise_pred, t, t_prev)  # Use DDIM sampling
         else:
             xt, x0_pred = scheduler.sample_prev_timestep(xt, noise_pred, torch.as_tensor(i).to(device))  # Use DDPM sampling
@@ -98,18 +105,24 @@ def sample(model, scheduler, train_config, diffusion_model_config,
         
         ims = torch.clamp(ims, -1., 1.).detach().cpu()
         ims = (ims + 1) / 2
-        grid = make_grid(ims, nrow=1)
-        img = torchvision.transforms.ToPILImage()(grid)
 
-        if not os.path.exists(os.path.join(train_config['task_name'], 'cond_attr_samples', current_time)):
-            os.mkdir(os.path.join(train_config['task_name'], 'cond_attr_samples', current_time))
-        img.save(os.path.join(train_config['task_name'], 'cond_attr_samples', current_time, 'x0_{}.png'.format(i)))
-        img.close()
+        if dir != '':
+            grid = make_grid(ims, nrow=1)
+            img = torchvision.transforms.ToPILImage()(grid)
+
+
+            if not os.path.exists(os.path.join(train_config['task_name'], 'cond_attr_samples', dir, current_time)):
+                os.makedirs(os.path.join(train_config['task_name'], 'cond_attr_samples', dir, current_time), exist_ok=True)
+            img.save(os.path.join(train_config['task_name'], 'cond_attr_samples', dir, current_time, 'x0_{}.png'.format(i)))
+            img.close()
+
+        # save latent to pt        
+        #torch.save(xt, os.path.join(train_config['task_name'], 'cond_attr_samples', dir, current_time, 'xt_{}.pt'.format(i)))
     ##############################################################
 
     return ims, cond_input
 
-def ddim_inversion(scheduler, vae, xt, diffusion_config, condition_input, model, train_config, num_inference_steps=None):
+def ddim_inversion(scheduler, vae, xt, diffusion_config, condition_input, model, train_config, num_inference_steps=None, dir='', save_img=True):
     r"""
     Reverse the process by diffusing the image forward in time.
     :param scheduler: the noise scheduler used (e.g., LinearNoiseSchedulerDDIM)
@@ -135,18 +148,19 @@ def ddim_inversion(scheduler, vae, xt, diffusion_config, condition_input, model,
 
     current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    current_timestep = 1  # Start at the first timestep
+    
     intermediate_latents = []
     # Move forward in time by applying noise progressively
-    for i in tqdm(range(0, num_inference_steps), total=num_inference_steps):
-        t = (torch.ones((z.shape[0],)) * i).long().to(z.device)
+    for i in tqdm(range(1, num_inference_steps), total=num_inference_steps):
+        t = (torch.ones((z.shape[0],)) * (i * (all_timesteps // num_inference_steps) + 1)).long().to(z.device)
 
         if i >= num_inference_steps - 1: continue
 
         # Predict noise based on current step and conditions
         noise_pred = model(z, t, condition_input)
         
-        next_timestep = min(current_timestep + all_timesteps // num_inference_steps, all_timesteps) - 1
+        next_timestep = t
+        current_timestep = max(0, t - (all_timesteps // num_inference_steps))
 
         # Use the noise prediction to forward-sample to the next timestep using DDIM forward equation
         # Reverse the reverse process from sample_prev_timestep
@@ -172,26 +186,29 @@ def ddim_inversion(scheduler, vae, xt, diffusion_config, condition_input, model,
 
         intermediate_latents.append(z)
 
-        current_timestep = next_timestep
+        if save_img:
+            ims_clamped = torch.clamp(z, -1., 1.).detach().cpu()
+            ims_clamped = (ims_clamped + 1) / 2  # Rescale to [0, 1]
+            
+            # Convert to image and save
+            grid = make_grid(ims_clamped, nrow=1)
+            img = torchvision.transforms.ToPILImage()(grid)
+            
+            # Save images at each step for visualization
+            save_dir = os.path.join(train_config['task_name'], 'cond_attr_samples', dir, current_time)
+            if not os.path.exists(save_dir):
+                os.makedirs(save_dir, exist_ok=True)
 
-        ims_clamped = torch.clamp(z, -1., 1.).detach().cpu()
-        ims_clamped = (ims_clamped + 1) / 2  # Rescale to [0, 1]
-        
-        # Convert to image and save
-        grid = make_grid(ims_clamped, nrow=1)
-        img = torchvision.transforms.ToPILImage()(grid)
-        
-        # Save images at each step for visualization
-        save_dir = os.path.join(train_config['task_name'], 'reverse_ddim_samples', current_time)
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir, exist_ok=True)
+            
+                # Save the image corresponding to the current timestep
+                img.save(os.path.join(save_dir, 'x0_{}.png'.format(i)))
+            img.close()
 
-        # Save the image corresponding to the current timestep
-        img.save(os.path.join(save_dir, 'x0_{}.png'.format(i)))
-        img.close()
+    # convert to torch tensor
+    intermediate_latents = torch.stack(intermediate_latents, dim=0)
 
     # Return the final noisy latent z and the predicted noise used for the inversion
-    return z, intermediate_latents
+    return intermediate_latents
 
 
 def infer(args):
