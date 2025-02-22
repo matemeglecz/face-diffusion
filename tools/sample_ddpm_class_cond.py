@@ -10,6 +10,7 @@ from models.unet_cond_base import Unet
 from models.vqvae import VQVAE
 from scheduler.linear_noise_scheduler import LinearNoiseScheduler
 from utils.config_utils import *
+from collections import OrderedDict
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -44,7 +45,10 @@ def sample(model, scheduler, train_config, diffusion_model_config,
     sample_classes = torch.randint(0, num_classes, (train_config['num_samples'], ))
     print('Generating images for {}'.format(list(sample_classes.numpy())))
     cond_input = {
-        'class': torch.nn.functional.one_hot(sample_classes, num_classes).to(device)
+        # 'class': torch.nn.functional.one_hot(sample_classes, num_classes).to(device)
+        #  ['Male', 'Young', 'Bald', 'Bangs', 'Receding_Hairline', 'Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Gray_Hair', 'Straight_Hair', 'Wavy_Hair', 'No_Beard', 'Goatee', 'Mustache', 'Sideburns', 'Narrow_Eyes', 'Oval_Face', 'Pale_Skin', 'Pointy_Nose']
+        'class': torch.tensor([[0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0]]).to(device)
+
     }
     # Unconditional input for classifier free guidance
     uncond_input = {
@@ -116,10 +120,19 @@ def infer(args):
     model.eval()
     if os.path.exists(os.path.join(train_config['task_name'],
                                    train_config['ldm_ckpt_name'])):
-        print('Loaded unet checkpoint')
-        model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
+        
+
+        ddp_state_dict = torch.load(os.path.join(train_config['task_name'],
                                                       train_config['ldm_ckpt_name']),
-                                         map_location=device))
+                                         map_location=device)
+        new_state_dict = OrderedDict()
+        for k, v in ddp_state_dict.items():
+            name = k[7:] # remove `module.`
+            new_state_dict[name] = v
+        
+        ddp_state_dict = new_state_dict
+        print('Loaded unet checkpoint')
+        model.load_state_dict(ddp_state_dict)
     else:
         raise Exception('Model checkpoint {} not found'.format(os.path.join(train_config['task_name'],
                                                                             train_config['ldm_ckpt_name'])))

@@ -301,6 +301,15 @@ def train(rank, world_size, args):
             np.mean(losses)))
         
         if rank == 0:
+            # copy previous save to backup if exists
+            if os.path.exists(os.path.join(train_config['task_name'],
+                                           train_config['ldm_ckpt_name'])):
+                os.system('cp {} {}'.format(os.path.join(train_config['task_name'],
+                                                        train_config['ldm_ckpt_name']),
+                                            os.path.join(train_config['task_name'],
+                                                        'backup_' + train_config['ldm_ckpt_name'])))
+
+
             torch.save(model.state_dict(), os.path.join(train_config['task_name'],
                                                     train_config['ldm_ckpt_name']))
     

@@ -129,6 +129,8 @@ sample_config = config['sample_params']
 
 ########## Create the noise scheduler #############
 
+sample_config['use_ddim'] = True
+
 if sample_config['use_ddim']:
     print('Using DDIM')
     scheduler = LinearNoiseSchedulerDDIM(num_timesteps=diffusion_config['num_timesteps'],
@@ -199,7 +201,7 @@ else:
                                                 train_config['vqvae_autoencoder_ckpt_name'])))
 #####################################
 
-im_dataset_train = CelebDataset(split='val',
+im_dataset_train = CelebDataset(split='test',
                                 im_path=dataset_config['im_path'],
                                 im_size=dataset_config['im_size'],
                                 im_channels=dataset_config['im_channels'],
@@ -212,10 +214,88 @@ im_dataset_train = CelebDataset(split='val',
 
 
 
-dataloader = DataLoader(im_dataset_train, batch_size=1, shuffle=False)
+dataloader = DataLoader(im_dataset_train, batch_size=4, shuffle=False)
 
 
-save_dir = '/mnt/g/data/experimental_samples/'
+['Male', 'Young', 'Bald', 'Bangs', 'Receding_Hairline', 'Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Gray_Hair', 'Straight_Hair', 'Wavy_Hair', 'No_Beard', 'Goatee', 'Mustache', 'Sideburns', 'Narrow_Eyes', 'Oval_Face', 'Pale_Skin', 'Pointy_Nose']
+
+def randomly_modify_attrubute(cond):
+    # randomly modify the attributes
+    num_attributes = cond.shape[1]
+
+
+    hair_types = ['Bald', 'Straight_Hair', 'Wavy_Hair']
+    hair_types_idx = [2, 9, 10]
+
+    facial_hair = ['No_Beard', 'Goatee', 'Mustache', 'Sideburns']
+    facial_hair_idx = [11, 12, 13, 14]
+
+    hair_specific = ['Receding_Hairline', 'Bangs']
+    hair_specific_idx = [4, 3]
+
+    facial_features = ['Narrow_Eyes', 'Oval_Face', 'Pale_Skin', 'Pointy_Nose']
+    facial_features_idx = [15, 16, 17, 18]
+
+    hair_color = ['Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Gray_Hair']
+    hair_color_idx = [5, 6, 7, 8]
+
+    # choose a random attribute to modify
+    attribute_idx = np.random.randint(0, num_attributes)
+
+    cond[0, attribute_idx] = 1 - cond[0, attribute_idx]
+
+    if attribute_idx == 0 and cond[0, attribute_idx] == 0:
+        cond[0, 11] = 1
+        cond[0, 12] = 0
+        cond[0, 13] = 0
+        cond[0, 14] = 0
+    elif attribute_idx == 2 and cond[0, attribute_idx] == 1:
+        cond[0, 9] = 0
+        cond[0, 10] = 0
+        for i in hair_color_idx:
+            cond[0, i] = 0
+        cond[0, 3] = 0
+    
+    elif attribute_idx in hair_types_idx:
+        # make sure that one of the hair types is set to 1
+        if cond[0, 2] == 0 and cond[0, 9] == 0 and cond[0, 10] == 0:
+            # randomly choose one of the hair types
+            hair_type = np.random.randint(0, 2) + 1
+            cond[0, hair_types_idx[hair_type]] = 1
+    elif attribute_idx in facial_hair_idx:
+        # make sure that one of the facial hair is set to 1
+        if cond[0, 11] == 0 and cond[0, 12] == 0 and cond[0, 13] == 0 and cond[0, 14] == 0:
+            # randomly choose one of the facial hair
+            facial_hair = np.random.randint(0, 3) + 1
+            cond[0, facial_hair_idx[facial_hair]] = 1
+        if cond[0, 11] == 1:
+            cond[0, 12] = 0
+            cond[0, 13] = 0
+            cond[0, 14] = 0
+    elif attribute_idx in hair_specific_idx:
+        # make sure that maximum one of the hair specific is set to 1
+        if cond[0, 3] == 1 and cond[0, 4] == 1:
+            if attribute_idx == 3:
+                cond[0, 4] = 0
+            else:
+                cond[0, 3] = 0
+    elif attribute_idx in hair_color:
+        # check if more than one hair color is set to 1
+        hair_color_sum = torch.sum(cond[0, hair_color_idx])
+        if hair_color_sum > 1 or hair_color_sum == 0:
+            # randomly choose one of the hair colors to set to 1 and the rest to 0
+            hair_color = np.random.randint(0, 3)
+            for i in hair_color_idx:
+                if i == hair_color_idx[hair_color]:
+                    cond[0, i] = 1
+                else:
+                    cond[0, i] = 0
+
+    return cond
+            
+
+
+save_dir = '/mnt/g/data/condition_edit_test/'
 
 image_num = 0
 
@@ -223,8 +303,13 @@ images_all_syn = torch.tensor([])
 images_all_real = torch.tensor([])
 attribute_desc = torch.tensor([])
 
+# seed random for reproducibility
+torch.manual_seed(4)
+
+
 # for each image in the training set create a ddim inversion
 for i, (im_real, cond) in tqdm(enumerate(dataloader), total=len(dataloader)):
+
     # torch clear cache
     torch.cuda.empty_cache()
     im_real = im_real.to(device)
@@ -233,12 +318,26 @@ for i, (im_real, cond) in tqdm(enumerate(dataloader), total=len(dataloader)):
     cond = cond
     cond['attribute'] = cond['attribute'].to(device)
 
+    im_size = dataset_config['im_size'] // 2 ** sum(autoencoder_model_config['down_sample'])
+    
+    ########### Sample random noise latent ##########
+
+    xt = torch.randn((1,
+                    autoencoder_model_config['z_channels'],
+                    im_size,
+                    im_size)).to(device)    
+    
+    # repeat xt for the number of samples
+    xt = xt.repeat(4, 1, 1, 1)
+
+
     with torch.no_grad():
 
         cond = torch.tensor(cond['attribute']).to(device)
-
+        
+        
         img, cond_input = sample(model, cond, scheduler, train_config, diffusion_model_config,
-                                autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=sample_config['use_ddim'], noise_input=None)
+                                autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=True, noise_input=xt)
         
         attribute_desc = torch.cat((attribute_desc, attr), 0)
         # save the images
@@ -255,17 +354,16 @@ for i, (im_real, cond) in tqdm(enumerate(dataloader), total=len(dataloader)):
             img_j = Image.fromarray(img_j)
             img_j.save(os.path.join(save_dir, f'{image_num}.png'))
 
+            # save attribute description
+            attr = attr.cpu().numpy()
+            with open(os.path.join(save_dir, f'{image_num}.txt'), 'w') as f:
+                f.write(str(attr))
+
+
             image_num += 1
+                
         
-    
-# save the concatenated images into a pt file
-torch.save(images_all_syn, os.path.join(save_dir, 'celeba_test_images.pt'))
 
-# save the concatenated attributes into a pt file
-torch.save(attribute_desc, os.path.join(save_dir, 'celeba_test_attributes.pt'))
-
-# save the concatenated real images into a pt file
-torch.save(images_all_real, os.path.join(save_dir, 'celeba_test_real_images.pt'))
 
 
     

@@ -653,108 +653,149 @@ import numpy as np
 
 image_num = 0
 
-for i, (im_real, cond) in tqdm(enumerate(val_loader), total=len(val_loader)):
-    #if i in [3, 5, 6, 8, 14, 17, 20, 23, 25, 29, 30]:
-    #    image_num += 1
-    #    continue
+cond = torch.tensor([[1, # Male
+                      1, # Young
+                      0, # Bald
+                      0, # Bangs
+                      0, # Receding_Hairline
+                      0, # Black_Hair
+                      0, # Blond_Hair
+                      1, # Brown_Hair
+                      0, # Gray_Hair
+                      1, # Straight_Hair
+                      0, # Wavy_Hair
+                      0, # No_Beard
+                      1, # Goatee
+                      1, # Mustache
+                      0, # Sideburns
+                      0, # Narrow_Eyes
+                      1, # Oval_Face
+                      0, # Pale_Skin
+                      0  # Pointy_Nose
+                      ]]).to(device)
 
-    torch.cuda.empty_cache()
-    im_real = im_real.to(device)
-    attr = cond['attribute'].clone()    
+cond_dict = {}
+
+cond_dict['attribute'] = cond
+
+# load jpg image
+image = Image.open('/mnt/c/Users/Mate/Documents/BME/msc/dipterv/tdk/prezentacio/en.jpg')
+# resize to 512x512
+image = image.resize((512, 512))
+
+image = torchvision.transforms.ToTensor()(image).to(device)
+image = image.unsqueeze(0)
+
+ims = image
+
+im_real = ims
+
+
+torch.cuda.empty_cache()
+im_real = im_real.to(device)
+attr = cond_dict['attribute'].clone()    
+
+cond_dict['attribute'] = cond_dict['attribute'].to(device)
+
+cond = torch.tensor(cond_dict['attribute']).to(device)
+
+
+im_size = dataset_config['im_size'] // 2 ** sum(autoencoder_model_config['down_sample'])
+
+'''
+noise_input = torch.randn((train_config['num_samples'],
+                        autoencoder_model_config['z_channels'],
+                        im_size,
+                        im_size)).to(device)
+'''
+
+with torch.no_grad():
+    intermediate_latents = ddim_inversion(scheduler, vae, ims, diffusion_config, cond_dict, model, train_config, 200, save_img=False)
+
+
+noise_input = intermediate_latents[-1]
+                        
+with torch.no_grad():
+    ims_orig, cond_trans = sample(model, cond, scheduler, train_config, diffusion_model_config,
+                autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=True, dir='', noise_input=noise_input, num_steps=1000, start_step=0)
     
-    cond['attribute'] = cond['attribute'].to(device)
-
-    cond = torch.tensor(cond['attribute']).to(device)
-
-
-    im_size = dataset_config['im_size'] // 2 ** sum(autoencoder_model_config['down_sample'])
-
-    noise_input = torch.randn((train_config['num_samples'],
-                            autoencoder_model_config['z_channels'],
-                            im_size,
-                            im_size)).to(device)
     
-    with torch.no_grad():
-        ims_orig, cond_trans = sample(model, cond, scheduler, train_config, diffusion_model_config,
-                    autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=True, dir='', noise_input=noise_input, num_steps=1000, start_step=0)
-        
-        
 
-        prediction = oracle_classifier(transorm_for_classifier(ims_orig).to(device))
+    prediction = oracle_classifier(transorm_for_classifier(ims_orig).to(device))
 
-        prediction = torch.sigmoid(prediction)
+    prediction = torch.sigmoid(prediction)
 
+    target_label = 1
+    if prediction > 0.5:
+        target_label = 0
+    else:
         target_label = 1
-        if prediction > 0.5:
-            target_label = 0
-        else:
-            target_label = 1
 
-        noise_input_edited = noise_input.clone()
+    noise_input_edited = noise_input.clone()
 
-        if target_label == 1:
-            noise_input_edited += feature_direction_disentangled.to(device) * 15
-        else:
-            noise_input_edited -= feature_direction_disentangled.to(device) * 15
+    if target_label == 1:
+        noise_input_edited += feature_direction_disentangled.to(device) * 15
+    else:
+        noise_input_edited -= feature_direction_disentangled.to(device) * 15
 
-        ims_noise_edit, cond_trans = sample(model, cond, scheduler, train_config, diffusion_model_config,
-                    autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=True, dir='', noise_input=noise_input_edited, num_steps=1000, start_step=0)
+    ims_noise_edit, cond_trans = sample(model, cond, scheduler, train_config, diffusion_model_config,
+                autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=True, dir='', noise_input=noise_input_edited, num_steps=1000, start_step=0)
+    
+
+
+ims_guidance, cond_trans = sample_guidance(model, classifier_model, cond, scheduler, train_config, diffusion_model_config,
+            autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=True, dir='', noise_input=noise_input, num_steps=1000, start_step=0, target_label=target_label)
+
+ims_guidance_together, cond_trans = sample_guidance(model, classifier_model, cond, scheduler, train_config, diffusion_model_config,
+            autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=True, dir='', noise_input=noise_input_edited, num_steps=1000, start_step=0, target_label=target_label)
+
+
+
+# create predictions for each image
+
+prediction_noise_edited = predict_with_oracle(oracle_classifier, transorm_for_classifier(ims_noise_edit).to(device))
+
+prediction_guidance = predict_with_oracle(oracle_classifier, transorm_for_classifier(ims_guidance).to(device))
+
+prediction_guidance_together = predict_with_oracle(oracle_classifier, transorm_for_classifier(ims_guidance_together).to(device))
+
+
+for j in range(ims_orig.shape[0]):
+    img_j = ims_orig[j].permute(1, 2, 0).cpu().numpy()
+    img_j = (img_j * 255).astype(np.uint8)
+    img_j = Image.fromarray(img_j)
+    img_j.save(os.path.join(save_dir, f'{image_num}_orig.png'))
+
+    img_j = ims_noise_edit[j].permute(1, 2, 0).cpu().numpy()
+    img_j = (img_j * 255).astype(np.uint8)
+    img_j = Image.fromarray(img_j)
+    img_j.save(os.path.join(save_dir, f'{image_num}_noise_edit.png'))
+
+    img_j = ims_guidance[j].permute(1, 2, 0).cpu().numpy()
+    img_j = (img_j * 255).astype(np.uint8)
+    img_j = Image.fromarray(img_j)
+    img_j.save(os.path.join(save_dir, f'{image_num}_guidance.png'))
+
+    img_j = ims_guidance_together[j].permute(1, 2, 0).cpu().numpy()
+    img_j = (img_j * 255).astype(np.uint8)
+    img_j = Image.fromarray(img_j)
+    img_j.save(os.path.join(save_dir, f'{image_num}_guidance_together.png'))
+
+    #write cond to file txt
+    with open(os.path.join(save_dir, f'{image_num}.txt'), 'w') as f:
+        f.write(str(attr[j].cpu().numpy()))
+        # save prediction
+        f.write('\n')
+        f.write(str(prediction.item()))
+        f.write('\n')
+        f.write(str(prediction_noise_edited.item()))
+        f.write('\n')
+        f.write(str(prediction_guidance.item()))
+        f.write('\n')
+        f.write(str(prediction_guidance_together.item()))
         
 
-
-    ims_guidance, cond_trans = sample_guidance(model, classifier_model, cond, scheduler, train_config, diffusion_model_config,
-                autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=True, dir='', noise_input=noise_input, num_steps=1000, start_step=0, target_label=target_label)
-    
-    ims_guidance_together, cond_trans = sample_guidance(model, classifier_model, cond, scheduler, train_config, diffusion_model_config,
-                autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=True, dir='', noise_input=noise_input_edited, num_steps=1000, start_step=0, target_label=target_label)
-    
-
-
-    # create predictions for each image
-
-    prediction_noise_edited = predict_with_oracle(oracle_classifier, transorm_for_classifier(ims_noise_edit).to(device))
-
-    prediction_guidance = predict_with_oracle(oracle_classifier, transorm_for_classifier(ims_guidance).to(device))
-
-    prediction_guidance_together = predict_with_oracle(oracle_classifier, transorm_for_classifier(ims_guidance_together).to(device))
-
-
-    for j in range(ims_orig.shape[0]):
-        img_j = ims_orig[j].permute(1, 2, 0).cpu().numpy()
-        img_j = (img_j * 255).astype(np.uint8)
-        img_j = Image.fromarray(img_j)
-        img_j.save(os.path.join(save_dir, f'{image_num}_orig.png'))
-
-        img_j = ims_noise_edit[j].permute(1, 2, 0).cpu().numpy()
-        img_j = (img_j * 255).astype(np.uint8)
-        img_j = Image.fromarray(img_j)
-        img_j.save(os.path.join(save_dir, f'{image_num}_noise_edit.png'))
-
-        img_j = ims_guidance[j].permute(1, 2, 0).cpu().numpy()
-        img_j = (img_j * 255).astype(np.uint8)
-        img_j = Image.fromarray(img_j)
-        img_j.save(os.path.join(save_dir, f'{image_num}_guidance.png'))
-
-        img_j = ims_guidance_together[j].permute(1, 2, 0).cpu().numpy()
-        img_j = (img_j * 255).astype(np.uint8)
-        img_j = Image.fromarray(img_j)
-        img_j.save(os.path.join(save_dir, f'{image_num}_guidance_together.png'))
-
-        #write cond to file txt
-        with open(os.path.join(save_dir, f'{image_num}.txt'), 'w') as f:
-            f.write(str(attr[j].cpu().numpy()))
-            # save prediction
-            f.write('\n')
-            f.write(str(prediction.item()))
-            f.write('\n')
-            f.write(str(prediction_noise_edited.item()))
-            f.write('\n')
-            f.write(str(prediction_guidance.item()))
-            f.write('\n')
-            f.write(str(prediction_guidance_together.item()))
-            
-
-        image_num += 1
+    image_num += 1
 
         
 

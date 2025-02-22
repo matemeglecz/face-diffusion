@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, models, transforms
-from dataset.celeb_dataset import CelebDataset
+from dataset.latent_dataset import LatentDataset
+from dataset.latent_image_dataset import LatentImageDataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Subset
 import os
@@ -33,7 +34,7 @@ def cleanup():
     dist.destroy_process_group()
 
 def setup_wandb(config):
-    wandb.init(project="Face-diffusion", entity="megleczmate", sync_tensorboard=True, tags=["classifier"])
+    wandb.init(project="Face-diffusion", entity="megleczmate", sync_tensorboard=True, tags=["latent_classifier"])
     # get current time
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
@@ -45,54 +46,31 @@ def setup_wandb(config):
 # Training function
 def train_model(model, criterion, optimizer, condition_config, world_size, rank, num_epochs=25, wandb=None):
     # Path to CelebA dataset
-    data_dir = 'data/CelebAMask-HQ/'
+    data_dir = '/mnt/c/latents/250_raw'
 
     if rank == 0:
         wandb = setup_wandb(condition_config)
 
     # Load CelebA dataset with attribute labels
     image_datasets = {
-        'train': CelebDataset(split='train',
-                                    im_path=data_dir,
-                                    im_size=256,
-                                    im_channels=3,
-                                    condition_config=condition_config,
-                                    classification=True),
-        'val': CelebDataset(split='val',
-                                    im_path=data_dir,
-                                    im_size=256,
-                                    im_channels=3,
-                                    condition_config=condition_config,
-                                    classification=True),
+        'train': LatentImageDataset(data_dir,
+                                split='train',
+                                target_attributes=['Eyeglasses']),
+        'val': LatentImageDataset(data_dir,
+                                split='val',
+                                target_attributes=['Eyeglasses']),
     }
-    '''
-    with open('indexes_with_eyeglasses_all_train.pkl', 'rb') as f:
-        indexes_with_eyeglasses_all_train = pickle.load(f)
-
-    with open('indexes_without_eyeglasses_all_train.pkl', 'rb') as f:
-        indexes_without_eyeglasses_all_train = pickle.load(f)
-        indexes_without_eyeglasses_all_train = indexes_without_eyeglasses_all_train[:len(indexes_with_eyeglasses_all_train)]
-
-    with open('indexes_with_eyeglasses_all_val.pkl', 'rb') as f:
-        indexes_with_eyeglasses_all_val = pickle.load(f)
-
-    with open('indexes_without_eyeglasses_all_val.pkl', 'rb') as f:
-        indexes_without_eyeglasses_all_val = pickle.load(f)
-        indexes_without_eyeglasses_all_val = indexes_without_eyeglasses_all_val[:len(indexes_with_eyeglasses_all_val)]
-
-    image_datasets['train'] = Subset(image_datasets['train'], indexes_with_eyeglasses_all_train + indexes_without_eyeglasses_all_train)
-    image_datasets['val'] = Subset(image_datasets['val'], indexes_with_eyeglasses_all_val + indexes_without_eyeglasses_all_val)
-    '''
+    
     samplers = {
         'train': DistributedSampler(image_datasets['train'], num_replicas=world_size, rank=rank, shuffle=True),
         'val': DistributedSampler(image_datasets['val'], num_replicas=world_size, rank=rank, shuffle=False)
     }
-    
+
     # Data loaders
-    batch_size = 64
+    batch_size = 1024
     dataloaders = {
-        'train': DataLoader(image_datasets['train'], batch_size=batch_size, sampler=samplers['train'], num_workers=8),
-        'val': DataLoader(image_datasets['val'], batch_size=batch_size, sampler=samplers['val'], num_workers=8)
+        'train': DataLoader(image_datasets['train'], batch_size=batch_size, sampler=samplers['train'], num_workers=8, pin_memory=True),
+        'val': DataLoader(image_datasets['val'], batch_size=batch_size, sampler=samplers['val'], num_workers=8, pin_memory=True)
     }
 
     dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
@@ -122,7 +100,7 @@ def train_model(model, criterion, optimizer, condition_config, world_size, rank,
             running_loss = 0.0
 
             for inputs, labels in tqdm(dataloaders[phase]):
-                labels = labels['attribute'].float()
+                labels = labels.float()                
 
                 inputs = inputs.to(rank)
                 labels = labels.float().to(rank)
@@ -132,22 +110,16 @@ def train_model(model, criterion, optimizer, condition_config, world_size, rank,
                 with torch.set_grad_enabled(phase == 'train'):                    
                     outputs = model(inputs)
 
-                    # change weights for the loss function
-                    weights = torch.ones_like(labels)
-                    weights[labels == 1] = 1.0
-                    weights[labels == 0] = 1.0                    
 
-                    criterion = nn.BCEWithLogitsLoss(weight=weights)
 
                     loss = criterion(outputs, labels)
-                    
 
                     if phase == 'train':
                         loss.backward()
                         optimizer.step()
                         step_count += 1
 
-                        if (step_count % 200 == 0 or step_count == 1) and wandb is not None and rank == 0:
+                        if (step_count % 10 == 0 or step_count == 1) and wandb is not None and rank == 0:
                             wandb.log({'train_loss': loss.item()})
 
                     else:
@@ -192,7 +164,7 @@ def train_model(model, criterion, optimizer, condition_config, world_size, rank,
 
             if rank == 0:
                 # Save the model
-                torch.save(model.state_dict(), f'celeba_resnet50_nose_classifier_{epoch}.pth')
+                torch.save(model.state_dict(), f'celeba_resnet18_latent_glasses_classifier_{epoch}.pth')
 
     if rank == 0:
         wandb.finish()
@@ -202,17 +174,16 @@ def train_model(model, criterion, optimizer, condition_config, world_size, rank,
 
 def main(rank, world_size):
     setup(rank, world_size)
-    condition_config = {'task_name': 'celeba_attribute_classifier_resnet50_nose_attributes',
+    condition_config = {'task_name': 'celeba_attribute_classifier_resnet50_1_attributes',
                 'condition_types': [ 'attribute' ],
                 'attribute_condition_config': {
                     'attribute_condition_num': 1,
-                    'attribute_condition_selected_attrs': ['Big_Nose']#['Male', 'Young', 'Bald', 'Bangs', 'Receding_Hairline', 'Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Gray_Hair', 'Straight_Hair', 'Wavy_Hair', 'No_Beard', 'Goatee', 'Mustache', 'Sideburns', 'Narrow_Eyes', 'Oval_Face', 'Pale_Skin', 'Pointy_Nose']
-#['Eyeglasses',]# 'Heavy_Makeup', 'Smiling'],
+                    'attribute_condition_selected_attrs': ['Eyeglasses',]# 'Heavy_Makeup', 'Smiling'],
                     }
                 }
 
-    # Load pre-trained ResNet-50 model
-    model = models.resnet50(pretrained=True)
+    # Load pre-trained ResNet-18 model
+    model = models.resnet18(pretrained=False)
 
     
 
@@ -220,29 +191,29 @@ def main(rank, world_size):
     num_ftrs = model.fc.in_features
 
     model.fc = nn.Linear(num_ftrs, condition_config['attribute_condition_config']['attribute_condition_num'])
-    
+
+    '''
     # Freeze all layers except the last 4 layers
     for name, param in model.named_parameters():
         if 'layer4' not in name:
             param.requires_grad = False
-
+    '''
+            
     # Move model to GPU if available
     #device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = model.to(rank)
 
     model = DDP(model, device_ids=[rank])
 
-    # Define the loss function and optimizer for multi-class classification
-    criterion = nn.BCEWithLogitsLoss()
+    # Define the loss function and optimizer
+    criterion = nn.BCEWithLogitsLoss()  # For multi-label classification
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-5) # lr=1e-4
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
     # Train the model for 25 epochs
-    model = train_model(model, criterion, optimizer, condition_config, world_size, rank, num_epochs=6, wandb=None)
+    model = train_model(model, criterion, optimizer, condition_config, world_size, rank, num_epochs=3, wandb=None)
 
-    #if rank == 0:
-        # Save the model
-    #    torch.save(model.state_dict(), 'celeba_resnet50_all_classifier.pth')
+    
     
     cleanup()
 

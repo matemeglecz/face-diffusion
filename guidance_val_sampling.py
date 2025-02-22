@@ -13,18 +13,52 @@ from scheduler.linear_noise_scheduler_ddim import LinearNoiseSchedulerDDIM
 from utils.config_utils import *
 from collections import OrderedDict
 from datetime import datetime
+from tools.sample_ddpm_attr_cond import ddim_inversion
+from torchvision.transforms import Compose, Normalize
 from dataset.celeb_dataset import CelebDataset
-from torch.utils.data import DataLoader
-import numpy as np
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def sample(model, cond, scheduler, train_config, diffusion_model_config,
+# free gpu memory
+torch.cuda.empty_cache()
+
+
+def glasses_loss(x, classifier_model, device='cuda'):
+    # Create a resnet-18 model
+    
+    classifier_model.train()  # Ensure the model is in training mode
+
+    # Move the input tensor `x` to the correct device
+    x = x.to(device)
+
+    transforms = Compose([
+            #Normalize(mean=[-0.5047, -0.2201,  0.0777], std=[1.0066, 0.8887, 0.6669])
+            #Normalize(mean=[-0.4908,  0.0627,  0.1011], std=[0.5076, 0.4108, 0.4806])
+            #Normalize(mean=[-0.5099,  0.0534,  0.0902], std=[0.4977, 0.4097, 0.4811]) # smiles
+            Normalize(mean=[-0.4932,  0.0717,  0.0965], std=[0.5124, 0.4079, 0.4835]) # chubby, mouth
+        ])
+    x = transforms(x)
+
+    # Predict the glasses attribute
+    pred = classifier_model(x)
+
+    # Generate a target tensor with the same batch size as the input (assuming a binary classification task)
+    target = torch.ones(pred.size(0), 1).to(device)  # Assuming all targets are 1 (glasses present)
+
+    # Calculate the loss using Binary Cross Entropy
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    loss = loss_fn(pred, target)
+
+    # Return the loss with gradients enabled
+    return loss
+
+
+def sample(model, classifier_model, cond, scheduler, train_config, diffusion_model_config,
            autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=False, start_step=0, num_steps=1000, noise_input=None, dir=''):
     r"""
     Sample stepwise by going backward one timestep at a time.
     We save the x0 predictions
-    """
+    """    
 
     # seed random for reproducibility
     #torch.manual_seed(9)
@@ -40,7 +74,8 @@ def sample(model, cond, scheduler, train_config, diffusion_model_config,
                         im_size,
                         im_size)).to(device)
     ###############################################
-    
+
+
     ############# Validate the config #################
     condition_config = get_config_value(diffusion_model_config, key='condition_config', default_value=None)
     assert condition_config is not None, ("This sampling script is for class conditional "
@@ -77,13 +112,21 @@ def sample(model, cond, scheduler, train_config, diffusion_model_config,
         num_steps = diffusion_config['num_timesteps']
     
     ################# Sampling Loop ########################
-    for i in reversed(range(num_steps - start_step)):
+    for i in tqdm(reversed(range(num_steps - start_step)), total=num_steps):
+        torch.set_grad_enabled(True)
+        xt_in = xt.clone()
+
+        # activate gradient for xt
+        xt.requires_grad_(True)
+        
         timestep = ((i-1) * (1000 // num_steps)) + 1
         #print(timestep)
         
         # Get prediction of noise
         t = (torch.ones((xt.shape[0],))*timestep).long().to(device)
-        noise_pred_cond = model(xt, t, cond_input)
+        
+        with torch.no_grad():
+            noise_pred_cond = model(xt_in, t, cond_input)
         
         if cf_guidance_scale > 1:
             noise_pred_uncond = model(xt, t, uncond_input)
@@ -92,13 +135,47 @@ def sample(model, cond, scheduler, train_config, diffusion_model_config,
             noise_pred = noise_pred_cond
         
         # If DDIM is enabled, we need to also compute t_prev for the DDIM reverse process
+        
         if use_ddim:
-            timestep_prev = max(timestep - (1000 // num_steps), 1)
-            t_prev = (torch.ones((xt.shape[0],)).to(device) * max(timestep - (1000 // num_steps), 1)).long().to(device)
-            xt, x0_pred = scheduler.sample_prev_timestep(xt, noise_pred, timestep, timestep_prev)  # Use DDIM sampling
+            t_prev = (torch.ones((xt.shape[0],)).to(device) * max(t - (1000 // num_steps), 1)).long().to(device)
+            xt_new, x0_pred = scheduler.sample_prev_timestep(xt, noise_pred, t, t_prev)  # Use DDIM sampling
+        else:
+            xt_new, x0_pred = scheduler.sample_prev_timestep(xt, noise_pred, torch.as_tensor(i).to(device))  # Use DDPM sampling
+        
+
+        #loss = color_loss(x0_pred) * 2
+        # if not first step, use glasses loss
+
+        loss = glasses_loss(x0_pred, classifier_model) * 0.02
+
+        # set the loss to require grad
+        
+        #if i % 10 == 0:
+        #    print(i, "loss:", loss.item())
+
+        cond_grad = -torch.autograd.grad(loss, xt, retain_graph=True)[0] 
+
+        # momentum
+        if i < 950 and i > 200:
+            cond_grad = cond_grad + 0.9 * cond_grad_prev        
+        if i < 951:
+            cond_grad_prev = cond_grad
+
+        
+
+        # apply gradient clipping
+        cond_grad = torch.clamp(cond_grad, -0.05, 0.05)
+
+        
+        xt = xt + cond_grad
+        #print(cond_grad.max(), cond_grad.min())
+
+        if use_ddim:
+            t_prev = (torch.ones((xt.shape[0],)).to(device) * max(t - (1000 // num_steps), 1)).long().to(device)
+            xt, x0_pred = scheduler.sample_prev_timestep(xt, noise_pred, t, t_prev)  # Use DDIM sampling
         else:
             xt, x0_pred = scheduler.sample_prev_timestep(xt, noise_pred, torch.as_tensor(i).to(device))  # Use DDPM sampling
-       
+
         if i == 0:
             # Decode ONLY the final image to save time
             ims = vae.decode(xt)
@@ -108,11 +185,18 @@ def sample(model, cond, scheduler, train_config, diffusion_model_config,
         ims = torch.clamp(ims, -1., 1.).detach().cpu()
         ims = (ims + 1) / 2
         
+
+        # save latent to pt        
+        #torch.save(xt, os.path.join(train_config['task_name'], 'cond_attr_samples', dir, current_time, 'xt_{}.pt'.format(i)))
+    ##############################################################
+
     return ims, cond_input
 
 
-#with open('celebhq-512-64-train-komondor_b/celeba_komondor_512_b.yaml', 'r') as file:
-with open('celebhq-512-64-train-komondor_b_2/celeba_komondor_512_b_2.yaml', 'r') as file:
+# Read the config file #
+with open('celebhq-512-64-train-komondor_b/celeba_komondor_512_b.yaml', 'r') as file:
+#with open('celebhq-1024-64-16k-komondor/celeba_komondor_16k.yaml', 'r') as file:
+#with open('celebhq-512-64/celeba_komondor_512.yaml', 'r') as file:
     try:
         config = yaml.safe_load(file)
     except yaml.YAMLError as exc:
@@ -143,7 +227,7 @@ else:
 ########## Load Unet #############
 model = Unet(im_channels=autoencoder_model_config['z_channels'],
                 model_config=diffusion_model_config).to(device)
-model.eval()
+
 if os.path.exists(os.path.join(train_config['task_name'],
                                 train_config['ldm_ckpt_name'])):
     
@@ -163,6 +247,8 @@ if os.path.exists(os.path.join(train_config['task_name'],
 else:
     raise Exception('Model checkpoint {} not found'.format(os.path.join(train_config['task_name'],
                                                                         train_config['ldm_ckpt_name'])))
+
+model.train()
 #####################################
 
 # Create output directories
@@ -188,18 +274,47 @@ if os.path.exists(os.path.join(train_config['task_name'],
 
     for k, v in vae_state_dict.items():
         if k.startswith('module.'):
-            name = k[7:]        
-            new_state_dict[name] = v   
+            name = k[7:]
+        new_state_dict[name] = v   
 
     #new_state_dict = vae_state_dict     
     
-    vae.load_state_dict(new_state_dict, strict=False)
+    vae.load_state_dict(new_state_dict, strict=True)
 else:
     raise Exception('VAE checkpoint {} not found'.format(os.path.join(train_config['task_name'],
                                                 train_config['vqvae_autoencoder_ckpt_name'])))
 #####################################
+'''
+classifier_model = torchvision.models.resnet18(pretrained=False)
 
-im_dataset_train = CelebDataset(split='val',
+num_ftrs = classifier_model.fc.in_features
+
+# Modify the last fully connected layer for binary classification (1 output)
+classifier_model.fc = torch.nn.Linear(num_ftrs, 1)
+
+# Load weights from 'celeba_resnet18_latent_glasses_classifier_1.pth'
+state = torch.load('celeba_resnet18_latent_glasses_classifier_1.pth', map_location=device)
+
+new_state_dict = OrderedDict()
+for k, v in state.items():
+    name = k[7:]  # remove `module.`
+    new_state_dict[name] = v
+
+classifier_model.load_state_dict(new_state_dict)
+'''
+from models.simple_cnn import SimpleCNN
+
+classifier_model = SimpleCNN()
+#classifier_model.load_state_dict(torch.load('celeba_cnn_latent_glasses_classifier_0.pth', map_location=device))
+classifier_model.load_state_dict(torch.load('celeba_cnn_latent_mouth_classifier_0_700_ddpm.pth', map_location=device))
+
+
+
+classifier_model.to(device)
+
+
+
+im_dataset_val = CelebDataset(split='val',
                                 im_path=dataset_config['im_path'],
                                 im_size=dataset_config['im_size'],
                                 im_channels=dataset_config['im_channels'],
@@ -210,62 +325,62 @@ im_dataset_train = CelebDataset(split='val',
                                 )
 
 
+torch.manual_seed(4)
 
 
-dataloader = DataLoader(im_dataset_train, batch_size=1, shuffle=False)
+# dataloader
+val_loader = torch.utils.data.DataLoader(im_dataset_val,
+                                        batch_size=1,
+                                        shuffle=False,
+                                        num_workers=4,)
 
+# sample
 
-save_dir = '/mnt/g/data/experimental_samples/'
+save_dir = '/mnt/g/data/mouth_val_0.02_warm_up_mid_shorter_2'
+
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+
+import numpy as np
 
 image_num = 0
 
-images_all_syn = torch.tensor([])
-images_all_real = torch.tensor([])
-attribute_desc = torch.tensor([])
+for i, (im_real, cond) in tqdm(enumerate(val_loader), total=len(val_loader)):
+    #if i in [3, 5, 6, 8, 14, 17, 20, 23, 25, 29, 30]:
+    #    image_num += 1
+    #    continue
 
-# for each image in the training set create a ddim inversion
-for i, (im_real, cond) in tqdm(enumerate(dataloader), total=len(dataloader)):
-    # torch clear cache
     torch.cuda.empty_cache()
     im_real = im_real.to(device)
     attr = cond['attribute'].clone()    
     
-    cond = cond
     cond['attribute'] = cond['attribute'].to(device)
 
-    with torch.no_grad():
+    cond = torch.tensor(cond['attribute']).to(device)
 
-        cond = torch.tensor(cond['attribute']).to(device)
 
-        img, cond_input = sample(model, cond, scheduler, train_config, diffusion_model_config,
-                                autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=sample_config['use_ddim'], noise_input=None)
-        
-        attribute_desc = torch.cat((attribute_desc, attr), 0)
-        # save the images
-        for j in range(img.shape[0]):
-            # concatenate the images
-            images_all_syn = torch.cat((images_all_syn, img[j].unsqueeze(0)), dim=0)
+    im_size = dataset_config['im_size'] // 2 ** sum(autoencoder_model_config['down_sample'])
 
-            im_real = im_real.detach().cpu()
+    noise_input = torch.randn((train_config['num_samples'],
+                            autoencoder_model_config['z_channels'],
+                            im_size,
+                            im_size)).to(device)
 
-            images_all_real = torch.cat((images_all_real, im_real[j].unsqueeze(0)), dim=0)
-
-            img_j = img[j].permute(1, 2, 0).cpu().numpy()
-            img_j = (img_j * 255).astype(np.uint8)
-            img_j = Image.fromarray(img_j)
-            img_j.save(os.path.join(save_dir, f'{image_num}.png'))
-
-            image_num += 1
-        
+    ims, cond_trans = sample(model, classifier_model, cond, scheduler, train_config, diffusion_model_config,
+                autoencoder_model_config, diffusion_config, dataset_config, vae, use_ddim=True, dir='', noise_input=noise_input, num_steps=1000, start_step=0)
     
-# save the concatenated images into a pt file
-torch.save(images_all_syn, os.path.join(save_dir, 'celeba_test_images.pt'))
 
-# save the concatenated attributes into a pt file
-torch.save(attribute_desc, os.path.join(save_dir, 'celeba_test_attributes.pt'))
+    for j in range(ims.shape[0]):
+        img_j = ims[j].permute(1, 2, 0).cpu().numpy()
+        img_j = (img_j * 255).astype(np.uint8)
+        img_j = Image.fromarray(img_j)
+        img_j.save(os.path.join(save_dir, f'{image_num}.png'))
 
-# save the concatenated real images into a pt file
-torch.save(images_all_real, os.path.join(save_dir, 'celeba_test_real_images.pt'))
+        #write cond to file txt
+        with open(os.path.join(save_dir, f'{image_num}.txt'), 'w') as f:
+            f.write(str(attr[j].cpu().numpy()))
 
+        image_num += 1
 
-    
+        
+

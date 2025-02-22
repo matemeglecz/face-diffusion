@@ -37,7 +37,7 @@ def infer(args):
         'celebhq': CelebDataset,
     }.get(dataset_config['name'])
     
-    im_dataset = im_dataset_cls(split='train',
+    im_dataset = im_dataset_cls(split='val',
                                 im_path=dataset_config['im_path'],
                                 im_size=dataset_config['im_size'],
                                 im_channels=dataset_config['im_channels'])
@@ -61,15 +61,15 @@ def infer(args):
 
     from collections import OrderedDict
 
-    ddp_state_dict = torch.load(os.path.join('/workspace/face-diffusion/',train_config['task_name'],
+    ddp_state_dict = torch.load(os.path.join(train_config['task_name'],
                                                     train_config['vqvae_autoencoder_ckpt_name']), map_location=device)
-    '''
+    
     new_state_dict = OrderedDict()
     for k, v in ddp_state_dict.items():
         name = k[7:] # remove `module.`
         new_state_dict[name] = v
-'''
-    new_state_dict = ddp_state_dict
+
+    #new_state_dict = ddp_state_dict
     model.load_state_dict(new_state_dict)
     model.eval()
     

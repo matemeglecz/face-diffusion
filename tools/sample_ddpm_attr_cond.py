@@ -200,8 +200,8 @@ def ddim_inversion(scheduler, vae, xt, diffusion_config, condition_input, model,
                 os.makedirs(save_dir, exist_ok=True)
 
             
-                # Save the image corresponding to the current timestep
-                img.save(os.path.join(save_dir, 'x0_{}.png'.format(i)))
+            # Save the image corresponding to the current timestep
+            img.save(os.path.join(save_dir, 'x0_{}.png'.format(i)))
             img.close()
 
     # convert to torch tensor
